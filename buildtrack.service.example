@@ -1,0 +1,45 @@
+# Systemd Service Unit File for BuildTrack AMS
+# Place this file in /etc/systemd/system/buildtrack.service
+# Enable with: sudo systemctl daemon-reload && sudo systemctl enable --now buildtrack
+
+[Unit]
+Description=BuildTrack AMS - Enterprise Attendance & Payroll System (Nabi Tech PLC)
+Documentation=https://nabitechplc.com
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/var/www/buildtrack
+
+# Node.js binary path and entry point
+ExecStart=/usr/bin/node /var/www/buildtrack/dist/server.cjs
+
+# Auto restart on failure with brief backoff
+Restart=always
+RestartSec=10
+
+# Production Environment Variables
+Environment=NODE_ENV=production
+Environment=PORT=3000
+Environment=JWT_SECRET=replace_with_a_secure_cryptographic_random_string_min_32_chars
+Environment=APP_URL=https://attendance.nabitechplc.com
+Environment=PATH=/usr/bin:/usr/local/bin
+
+# Resource limits & Process Sandboxing
+LimitNOFILE=65536
+LimitNPROC=4096
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+NoNewPrivileges=true
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=buildtrack-ams
+
+[Install]
+WantedBy=multi-user.target

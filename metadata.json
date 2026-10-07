@@ -1,0 +1,11 @@
+{
+  "name": "Attendance Management System Website adding penality page",
+  "description": "Enterprise attendance and leave management system featuring QR and GPS check-ins, work calendar, Ethiopian time conversion, overtime management, and late arrival penalty tracking with automated payroll deductions.",
+  "requestFramePermissions": [
+    "camera",
+    "geolocation"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
