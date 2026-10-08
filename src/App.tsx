@@ -14,6 +14,7 @@ import { EmployeeOvertimeModal } from "./components/EmployeeOvertimeModal";
 import { EditCompensationModal } from "./components/EditCompensationModal";
 import { SalaryManagementTab } from "./components/SalaryManagementTab";
 import { WorkingDayStatusCard } from "./components/WorkingDayStatusCard";
+import { AttendanceScheduleSettingsTab } from "./components/AttendanceScheduleSettingsTab";
 import { useRealtimeSync } from "./utils/useRealtimeSync";
 import { OfflineIndicator } from "./components/OfflineIndicator";
 import { EnterprisePayslip, SalaryPayment, User } from "./types";
@@ -3216,6 +3217,14 @@ MYSQL_DATABASE=your_db_name`}
                         </span>
                       )}
                     </button>
+                    <button
+                      onClick={() => { setActiveTab("attendance_settings"); setIsMobileMenuOpen(false); }}
+                      className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-sm font-semibold text-left transition ${
+                        activeTab === "attendance_settings" ? "bg-blue-50 text-blue-600 font-bold" : "text-gray-600 hover:bg-gray-50"
+                      }`}
+                    >
+                      <Settings size={18} /> Schedule & Overtime Settings
+                    </button>
                   </>
                 )}
                 <button
@@ -3390,6 +3399,14 @@ MYSQL_DATABASE=your_db_name`}
                           {penaltyStats.penalizedCount}
                         </span>
                       )}
+                    </button>
+                    <button
+                      onClick={() => setActiveTab("attendance_settings")}
+                      className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-sm font-semibold text-left transition ${
+                        activeTab === "attendance_settings" ? "bg-blue-50 text-blue-600 font-bold" : "text-gray-600 hover:bg-gray-50"
+                      }`}
+                    >
+                      <Settings size={18} /> Schedule & Overtime Settings
                     </button>
                   </>
                 )}
@@ -6281,6 +6298,11 @@ MYSQL_DATABASE=your_db_name`}
                 initialTab={missingCheckoutInitialTab}
               />
             </div>
+          )}
+
+          {/* Module 13: Attendance & Work Schedule Settings Page */}
+          {activeTab === "attendance_settings" && (
+            <AttendanceScheduleSettingsTab />
           )}
 
           <div className="pt-6 pb-2 mt-auto">

@@ -52,6 +52,31 @@ function ensureColumnMigrations() {
   addCol("site_settings", "holiday_overtime_multiplier", "DOUBLE DEFAULT 2.5");
   addCol("site_settings", "night_overtime_multiplier", "DOUBLE DEFAULT 1.5");
   addCol("site_settings", "allowed_radius", "DOUBLE DEFAULT 35.0");
+  addCol("site_settings", "work_start_time", "VARCHAR(20) DEFAULT '08:30'");
+  addCol("site_settings", "work_end_time", "VARCHAR(20) DEFAULT '17:30'");
+  addCol("site_settings", "required_daily_hours", "DOUBLE DEFAULT 8.0");
+  addCol("site_settings", "morning_start_time", "VARCHAR(20) DEFAULT '08:30'");
+  addCol("site_settings", "morning_end_time", "VARCHAR(20) DEFAULT '12:30'");
+  addCol("site_settings", "afternoon_start_time", "VARCHAR(20) DEFAULT '13:30'");
+  addCol("site_settings", "afternoon_end_time", "VARCHAR(20) DEFAULT '17:30'");
+  addCol("site_settings", "earliest_checkin_time", "VARCHAR(20) DEFAULT '07:00'");
+  addCol("site_settings", "latest_checkin_time", "VARCHAR(20) DEFAULT '10:30'");
+  addCol("site_settings", "prevent_duplicate_checkin", "INT DEFAULT 1");
+  addCol("site_settings", "early_arrival_as_overtime", "INT DEFAULT 0");
+  addCol("site_settings", "authorized_early_overtime_enabled", "INT DEFAULT 1");
+  addCol("site_settings", "early_overtime_requires_approval", "INT DEFAULT 1");
+  addCol("site_settings", "earliest_checkout_time", "VARCHAR(20) DEFAULT '16:30'");
+  addCol("site_settings", "latest_checkout_time", "VARCHAR(20) DEFAULT '20:00'");
+  addCol("site_settings", "checkout_grace_minutes", "INT DEFAULT 30");
+  addCol("site_settings", "prevent_checkout_without_checkin", "INT DEFAULT 1");
+  addCol("site_settings", "prevent_duplicate_checkout", "INT DEFAULT 1");
+  addCol("site_settings", "missing_checkout_auto_overtime", "INT DEFAULT 0");
+  addCol("site_settings", "overtime_enabled", "INT DEFAULT 1");
+  addCol("site_settings", "overtime_start_time", "VARCHAR(20) DEFAULT '17:30'");
+  addCol("site_settings", "min_overtime_minutes", "INT DEFAULT 30");
+  addCol("site_settings", "max_overtime_daily_hours", "DOUBLE DEFAULT 4.0");
+  addCol("site_settings", "max_overtime_weekly_hours", "DOUBLE DEFAULT 12.0");
+  addCol("site_settings", "require_overtime_approval", "INT DEFAULT 1");
 
   // overtime_records columns
   addCol("overtime_records", "notes", "TEXT");

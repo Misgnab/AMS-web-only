@@ -1678,10 +1678,54 @@ app.put("/api/site-settings", authenticateToken, (req: AuthenticatedRequest, res
     normal_overtime_multiplier,
     rest_day_overtime_multiplier,
     holiday_overtime_multiplier,
-    night_overtime_multiplier
+    night_overtime_multiplier,
+    // Regular Work Schedule
+    work_start_time,
+    work_end_time,
+    required_daily_hours,
+    morning_start_time,
+    morning_end_time,
+    afternoon_start_time,
+    afternoon_end_time,
+    // Check-in Rules
+    earliest_checkin_time,
+    latest_checkin_time,
+    prevent_duplicate_checkin,
+    early_arrival_as_overtime,
+    authorized_early_overtime_enabled,
+    early_overtime_requires_approval,
+    // Check-out Rules
+    earliest_checkout_time,
+    latest_checkout_time,
+    checkout_grace_minutes,
+    prevent_checkout_without_checkin,
+    prevent_duplicate_checkout,
+    missing_checkout_auto_overtime,
+    // Overtime Rules
+    overtime_enabled,
+    overtime_start_time,
+    min_overtime_minutes,
+    max_overtime_daily_hours,
+    max_overtime_weekly_hours,
+    require_overtime_approval,
+    weekly_schedule
   } = req.body;
 
   try {
+    // Validation for conflicting settings
+    if (min_overtime_minutes !== undefined && Number(min_overtime_minutes) < 0) {
+      return res.status(400).json({ error: "Validation Error: Minimum overtime duration cannot be negative." });
+    }
+    if (max_overtime_daily_hours !== undefined && Number(max_overtime_daily_hours) <= 0) {
+      return res.status(400).json({ error: "Validation Error: Maximum daily overtime must be greater than zero." });
+    }
+    if (max_overtime_weekly_hours !== undefined && max_overtime_daily_hours !== undefined && Number(max_overtime_weekly_hours) < Number(max_overtime_daily_hours)) {
+      return res.status(400).json({ error: "Validation Error: Maximum weekly overtime cannot be less than daily overtime." });
+    }
+    if (normal_overtime_multiplier !== undefined && Number(normal_overtime_multiplier) < 1.0) {
+      return res.status(400).json({ error: "Validation Error: Overtime multiplier must be at least 1.0x." });
+    }
+
     let existing: any = db.prepare("SELECT * FROM site_settings WHERE workspace_id = ?").get(targetWorkspaceId);
     if (!existing) {
       db.prepare(`
@@ -1720,6 +1764,39 @@ app.put("/api/site-settings", authenticateToken, (req: AuthenticatedRequest, res
     const cleanHolidayOt = holiday_overtime_multiplier !== undefined && !isNaN(parseFloat(holiday_overtime_multiplier)) ? parseFloat(holiday_overtime_multiplier) : (existing.holiday_overtime_multiplier ?? 2.5);
     const cleanNightOt = night_overtime_multiplier !== undefined && !isNaN(parseFloat(night_overtime_multiplier)) ? parseFloat(night_overtime_multiplier) : (existing.night_overtime_multiplier ?? 1.5);
 
+    // Regular Work Schedule Values
+    const cleanWorkStart = work_start_time !== undefined ? work_start_time.trim() : (existing.work_start_time || "08:30");
+    const cleanWorkEnd = work_end_time !== undefined ? work_end_time.trim() : (existing.work_end_time || "17:30");
+    const cleanReqDailyHours = required_daily_hours !== undefined && !isNaN(parseFloat(required_daily_hours)) ? parseFloat(required_daily_hours) : (existing.required_daily_hours ?? 8.0);
+    const cleanMorningStart = morning_start_time !== undefined ? morning_start_time.trim() : (existing.morning_start_time || "08:30");
+    const cleanMorningEnd = morning_end_time !== undefined ? morning_end_time.trim() : (existing.morning_end_time || "12:30");
+    const cleanAfternoonStart = afternoon_start_time !== undefined ? afternoon_start_time.trim() : (existing.afternoon_start_time || "13:30");
+    const cleanAfternoonEnd = afternoon_end_time !== undefined ? afternoon_end_time.trim() : (existing.afternoon_end_time || "17:30");
+
+    // Check-in Rules Values
+    const cleanEarliestCheckin = earliest_checkin_time !== undefined ? earliest_checkin_time.trim() : (existing.earliest_checkin_time || "07:00");
+    const cleanLatestCheckin = latest_checkin_time !== undefined ? latest_checkin_time.trim() : (existing.latest_checkin_time || "10:30");
+    const cleanPreventDupCheckin = prevent_duplicate_checkin !== undefined ? (prevent_duplicate_checkin ? 1 : 0) : (existing.prevent_duplicate_checkin ?? 1);
+    const cleanEarlyArrivalOt = early_arrival_as_overtime !== undefined ? (early_arrival_as_overtime ? 1 : 0) : (existing.early_arrival_as_overtime ?? 0);
+    const cleanAuthEarlyOt = authorized_early_overtime_enabled !== undefined ? (authorized_early_overtime_enabled ? 1 : 0) : (existing.authorized_early_overtime_enabled ?? 1);
+    const cleanEarlyOtRequiresApproval = early_overtime_requires_approval !== undefined ? (early_overtime_requires_approval ? 1 : 0) : (existing.early_overtime_requires_approval ?? 1);
+
+    // Check-out Rules Values
+    const cleanEarliestCheckout = earliest_checkout_time !== undefined ? earliest_checkout_time.trim() : (existing.earliest_checkout_time || "16:30");
+    const cleanLatestCheckout = latest_checkout_time !== undefined ? latest_checkout_time.trim() : (existing.latest_checkout_time || "20:00");
+    const cleanCheckoutGrace = checkout_grace_minutes !== undefined && !isNaN(parseInt(checkout_grace_minutes, 10)) ? parseInt(checkout_grace_minutes, 10) : (existing.checkout_grace_minutes ?? 30);
+    const cleanPreventCheckoutNoCheckin = prevent_checkout_without_checkin !== undefined ? (prevent_checkout_without_checkin ? 1 : 0) : (existing.prevent_checkout_without_checkin ?? 1);
+    const cleanPreventDupCheckout = prevent_duplicate_checkout !== undefined ? (prevent_duplicate_checkout ? 1 : 0) : (existing.prevent_duplicate_checkout ?? 1);
+    const cleanMissingCheckoutOt = missing_checkout_auto_overtime !== undefined ? (missing_checkout_auto_overtime ? 1 : 0) : (existing.missing_checkout_auto_overtime ?? 0);
+
+    // Overtime Rules Values
+    const cleanOtEnabled = overtime_enabled !== undefined ? (overtime_enabled ? 1 : 0) : (existing.overtime_enabled ?? 1);
+    const cleanOtStartTime = overtime_start_time !== undefined ? overtime_start_time.trim() : (existing.overtime_start_time || "17:30");
+    const cleanMinOtMins = min_overtime_minutes !== undefined && !isNaN(parseInt(min_overtime_minutes, 10)) ? parseInt(min_overtime_minutes, 10) : (existing.min_overtime_minutes ?? 30);
+    const cleanMaxDailyOt = max_overtime_daily_hours !== undefined && !isNaN(parseFloat(max_overtime_daily_hours)) ? parseFloat(max_overtime_daily_hours) : (existing.max_overtime_daily_hours ?? 4.0);
+    const cleanMaxWeeklyOt = max_overtime_weekly_hours !== undefined && !isNaN(parseFloat(max_overtime_weekly_hours)) ? parseFloat(max_overtime_weekly_hours) : (existing.max_overtime_weekly_hours ?? 12.0);
+    const cleanRequireOtApproval = require_overtime_approval !== undefined ? (require_overtime_approval ? 1 : 0) : (existing.require_overtime_approval ?? 1);
+
     db.prepare(`
       UPDATE site_settings 
       SET office_name = ?, 
@@ -1739,6 +1816,31 @@ app.put("/api/site-settings", authenticateToken, (req: AuthenticatedRequest, res
           rest_day_overtime_multiplier = ?,
           holiday_overtime_multiplier = ?,
           night_overtime_multiplier = ?,
+          work_start_time = ?,
+          work_end_time = ?,
+          required_daily_hours = ?,
+          morning_start_time = ?,
+          morning_end_time = ?,
+          afternoon_start_time = ?,
+          afternoon_end_time = ?,
+          earliest_checkin_time = ?,
+          latest_checkin_time = ?,
+          prevent_duplicate_checkin = ?,
+          early_arrival_as_overtime = ?,
+          authorized_early_overtime_enabled = ?,
+          early_overtime_requires_approval = ?,
+          earliest_checkout_time = ?,
+          latest_checkout_time = ?,
+          checkout_grace_minutes = ?,
+          prevent_checkout_without_checkin = ?,
+          prevent_duplicate_checkout = ?,
+          missing_checkout_auto_overtime = ?,
+          overtime_enabled = ?,
+          overtime_start_time = ?,
+          min_overtime_minutes = ?,
+          max_overtime_daily_hours = ?,
+          max_overtime_weekly_hours = ?,
+          require_overtime_approval = ?,
           updated_at = CURRENT_TIMESTAMP
       WHERE workspace_id = ?
     `).run(
@@ -1759,11 +1861,69 @@ app.put("/api/site-settings", authenticateToken, (req: AuthenticatedRequest, res
       cleanRestOt,
       cleanHolidayOt,
       cleanNightOt,
+      cleanWorkStart,
+      cleanWorkEnd,
+      cleanReqDailyHours,
+      cleanMorningStart,
+      cleanMorningEnd,
+      cleanAfternoonStart,
+      cleanAfternoonEnd,
+      cleanEarliestCheckin,
+      cleanLatestCheckin,
+      cleanPreventDupCheckin,
+      cleanEarlyArrivalOt,
+      cleanAuthEarlyOt,
+      cleanEarlyOtRequiresApproval,
+      cleanEarliestCheckout,
+      cleanLatestCheckout,
+      cleanCheckoutGrace,
+      cleanPreventCheckoutNoCheckin,
+      cleanPreventDupCheckout,
+      cleanMissingCheckoutOt,
+      cleanOtEnabled,
+      cleanOtStartTime,
+      cleanMinOtMins,
+      cleanMaxDailyOt,
+      cleanMaxWeeklyOt,
+      cleanRequireOtApproval,
       targetWorkspaceId
     );
 
     if (office_name) {
       db.prepare("UPDATE workspaces SET name = ? WHERE id = ?").run(cleanOfficeName, targetWorkspaceId);
+    }
+
+    // Also update weekly schedule if provided
+    if (Array.isArray(weekly_schedule) && weekly_schedule.length > 0) {
+      const updateScheduleStmt = db.prepare(`
+        INSERT INTO work_schedules (
+          workspace_id, day_of_week, day_name, morning_status, afternoon_status, 
+          morning_start, morning_end, afternoon_start, afternoon_end, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(workspace_id, day_of_week) DO UPDATE SET
+          morning_status = excluded.morning_status,
+          afternoon_status = excluded.afternoon_status,
+          morning_start = excluded.morning_start,
+          morning_end = excluded.morning_end,
+          afternoon_start = excluded.afternoon_start,
+          afternoon_end = excluded.afternoon_end,
+          updated_at = CURRENT_TIMESTAMP
+      `);
+      for (const item of weekly_schedule) {
+        const dayNum = parseInt(item.day_of_week, 10);
+        updateScheduleStmt.run(
+          targetWorkspaceId,
+          dayNum,
+          item.day_name || `Day ${dayNum}`,
+          item.morning_status || "WORKING",
+          item.afternoon_status || "WORKING",
+          item.morning_start || cleanMorningStart,
+          item.morning_end || cleanMorningEnd,
+          item.afternoon_start || cleanAfternoonStart,
+          item.afternoon_end || cleanAfternoonEnd
+        );
+      }
     }
 
     const updated: any = db.prepare("SELECT * FROM site_settings WHERE workspace_id = ?").get(targetWorkspaceId);
@@ -1773,11 +1933,29 @@ app.put("/api/site-settings", authenticateToken, (req: AuthenticatedRequest, res
     broadcastServerEvent("SETTINGS_CHANGED", { workspaceId: targetWorkspaceId }, targetWorkspaceId);
     broadcastServerEvent("ATTENDANCE_CHANGED", { workspaceId: targetWorkspaceId, reason: "settings_updated" }, targetWorkspaceId);
 
-    res.json({ success: true, settings: safeUpdated });
+    res.json({ success: true, settings: safeUpdated, message: "Attendance & Work Schedule settings updated successfully." });
   } catch (error) {
     console.error("Update site settings error:", error);
     res.status(500).json({ error: "Internal server error" });
   }
+});
+
+// Dedicated routes for Attendance & Work Schedule Settings (alias for full single source of truth)
+app.get("/api/attendance/settings", authenticateToken, (req: AuthenticatedRequest, res: Response) => {
+  const workspaceId = req.user?.workspace_id || 1;
+  try {
+    const settings = AttendanceService.getSiteSettings(workspaceId);
+    const weeklySchedule = db.prepare("SELECT * FROM work_schedules WHERE workspace_id = ? ORDER BY day_of_week ASC").all(workspaceId);
+    res.json({ success: true, settings, weekly_schedule: weeklySchedule });
+  } catch (error) {
+    res.status(500).json({ error: "Failed to fetch attendance settings" });
+  }
+});
+
+app.put("/api/attendance/settings", authenticateToken, (req: AuthenticatedRequest, res: Response, next) => {
+  // Delegate directly to the verified PUT /api/site-settings handler logic above
+  req.url = "/api/site-settings";
+  (app as any).handle(req, res, next);
 });
 
 // Auto-Capture Current Office Public Network IP
@@ -3872,7 +4050,34 @@ app.post("/api/attendance/check-in", authenticateToken, (req: AuthenticatedReque
     gpsAccuracy = gpsEval.accuracy;
 
     const siteSettings = AttendanceService.getSiteSettings(workspaceId);
-    const lateness = AttendanceService.evaluateLateness(activeSession, nowTimeStr, siteSettings.late_grace_minutes);
+
+    // 1. Enforce Earliest Allowed Check-in Time
+    if (siteSettings.earliest_checkin_time && activeSession === "Morning") {
+      const [eh, em] = siteSettings.earliest_checkin_time.split(":").map(Number);
+      const earliestEthMins = (eh >= 7) ? ((eh - 6 + 24) % 24) * 60 + (em || 0) : eh * 60 + (em || 0);
+      if (nowTotalMins < earliestEthMins) {
+        return res.status(400).json({
+          error: `Check-in restriction: Early check-in is not permitted before ${siteSettings.earliest_checkin_time}. Company policy restricts check-in prior to this window.`,
+          code: "EARLIEST_CHECKIN_RESTRICTION",
+          earliest_allowed: siteSettings.earliest_checkin_time
+        });
+      }
+    }
+
+    // 2. Scheduled session start & lateness evaluation
+    const scheduledStartStr = activeSession === "Morning" ? siteSettings.morning_start_time : siteSettings.afternoon_start_time;
+    let scheduledStartEthMins = activeSession === "Morning" ? 150 : 450;
+    if (scheduledStartStr) {
+      const [sh, sm] = scheduledStartStr.split(":").map(Number);
+      scheduledStartEthMins = (sh >= 7) ? ((sh - 6 + 24) % 24) * 60 + (sm || 0) : sh * 60 + (sm || 0);
+    }
+
+    const lateness = AttendanceService.evaluateLateness(
+      activeSession, 
+      nowTimeStr, 
+      siteSettings.late_grace_minutes,
+      scheduledStartEthMins
+    );
     const status = lateness.isLate ? "Late" : "Present";
     const lateMinutes = lateness.lateMinutes || 0;
 
@@ -3897,7 +4102,8 @@ app.post("/api/attendance/check-in", authenticateToken, (req: AuthenticatedReque
     );
 
     const isNonWorking = effectiveStatus.status === "NON_WORKING";
-    const attendanceType = effectiveStatus.attendanceType;
+    // Early arrival on regular workday is NEVER automatically overtime
+    const attendanceType = isNonWorking ? effectiveStatus.attendanceType : "REGULAR_WORK";
     const workStatus = effectiveStatus.status;
     const workStatusReason = effectiveStatus.reason;
     const overtimeStatus = isNonWorking ? "PENDING" : null;
@@ -4190,17 +4396,31 @@ app.post("/api/attendance/check-out", authenticateToken, (req: AuthenticatedRequ
     calculatedDistance = gpsEval.distance;
     gpsAccuracy = gpsEval.accuracy;
 
+    const siteSettings = AttendanceService.getSiteSettings(workspaceId);
+
+    // Check if there is an approved early overtime authorization for today
+    let hasApprovedEarlyWork = false;
+    try {
+      const approvedEarlyOt = db.prepare(`
+        SELECT id FROM overtime_records 
+        WHERE employee_id = ? AND date = ? AND (reason LIKE '%EARLY%' OR notes LIKE '%EARLY%' OR overtime_type LIKE '%EARLY%') AND status = 'APPROVED'
+      `).get(req.user?.id, todayStr);
+      hasApprovedEarlyWork = !!approvedEarlyOt;
+    } catch (_) {}
+
     const checkInTime = record.check_in_time || (record.session === "Morning" ? "02:00:00" : "07:00:00");
     const breakdown = WorkCalendarService.computeAttendanceHoursBreakdown(
       workspaceId,
       todayStr,
       checkInTime,
       nowTimeStr,
-      record.session
+      record.session,
+      hasApprovedEarlyWork
     );
 
     const hasOvertime = breakdown.overtimeHours > 0;
-    const overtimeStatus = hasOvertime ? "PENDING" : null;
+    const requireApproval = (siteSettings.require_overtime_approval ?? 1) === 1;
+    const overtimeStatus = hasOvertime ? (requireApproval ? "PENDING" : "APPROVED") : null;
 
     db.prepare(`
       UPDATE attendance 
@@ -4258,6 +4478,7 @@ app.post("/api/attendance/check-out", authenticateToken, (req: AuthenticatedRequ
     let overtimeRecordId: number | null = null;
     if (hasOvertime) {
       const existingOt: any = db.prepare("SELECT id FROM overtime_records WHERE attendance_id = ?").get(record.id);
+      const initialStatus = requireApproval ? 'PENDING' : 'APPROVED';
       if (!existingOt) {
         const otRes = db.prepare(`
           INSERT INTO overtime_records (
@@ -4265,7 +4486,7 @@ app.post("/api/attendance/check-out", authenticateToken, (req: AuthenticatedRequ
             overtime_type, work_status, work_status_reason, hours, rate_multiplier, status,
             qr_verified, gps_verified, gps_latitude, gps_longitude, gps_accuracy, gps_distance
           )
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', 1, 1, ?, ?, ?, ?)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?, ?, ?)
         `).run(
           record.id,
           req.user?.id,
@@ -4278,6 +4499,7 @@ app.post("/api/attendance/check-out", authenticateToken, (req: AuthenticatedRequ
           breakdown.workStatusReason,
           breakdown.overtimeHours,
           breakdown.multiplier,
+          initialStatus,
           latitude ? parseFloat(latitude) : null,
           longitude ? parseFloat(longitude) : null,
           gpsAccuracy,
@@ -6111,7 +6333,11 @@ function calculateEnterprisePayrollForUser(
   const processedOtRecordIds = new Set<number>();
 
   const userWorkspaceId = user.workspace_id || 1;
+  const siteSettings = AttendanceService.getSiteSettings(userWorkspaceId);
   const multipliers = WorkCalendarService.getOvertimeMultipliers(userWorkspaceId);
+  const requireOtApproval = (siteSettings.require_overtime_approval ?? 1) === 1;
+  const otEnabled = (siteSettings.overtime_enabled ?? 1) === 1;
+  const maxWeeklyOt = Number(siteSettings.max_overtime_weekly_hours ?? 12.0);
 
   // Query approved overtime records from overtime_records table
   const approvedOvertimeRecords = db.prepare(`
@@ -6158,15 +6384,19 @@ function calculateEnterprisePayrollForUser(
 
             regularHours += rHours;
 
-            // Only count overtime towards pay if not rejected
+            // Only count overtime towards pay if overtime is enabled and approved (when approval required)
             let appliedOtMultiplier = 1.0;
             let appliedOtType = "REGULAR_OVERTIME";
 
-            if (a.overtime_status !== "REJECTED") {
-              const matchedOtRecord = a.id ? overtimeByAttendanceId.get(a.id) : null;
-              if (matchedOtRecord) {
-                processedOtRecordIds.add(matchedOtRecord.id);
-              }
+            const matchedOtRecord = a.id ? overtimeByAttendanceId.get(a.id) : null;
+            if (matchedOtRecord) {
+              processedOtRecordIds.add(matchedOtRecord.id);
+            }
+
+            const isOtApproved = matchedOtRecord ? (matchedOtRecord.status === "APPROVED") : (a.overtime_status === "APPROVED");
+            const isPayableOt = otEnabled && (requireOtApproval ? isOtApproved : (a.overtime_status !== "REJECTED" && (!matchedOtRecord || matchedOtRecord.status !== "REJECTED")));
+
+            if (isPayableOt) {
 
               const effectiveOtHours = matchedOtRecord ? Number(matchedOtRecord.hours) : otHours;
 

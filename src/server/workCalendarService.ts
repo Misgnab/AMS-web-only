@@ -221,28 +221,82 @@ export class WorkCalendarService {
   }
 
   /**
-   * Authoritative classification of hours on checkout
+   * Authoritative classification of hours on checkout (Single Source of Truth)
+   * Strictly enforces:
+   * 1. Regular work schedule (morning/afternoon/full-day)
+   * 2. Early arrival without approved work = NO overtime (regular hours only start at normal session start)
+   * 3. Work beyond normal end time must meet min_overtime_minutes to qualify as overtime
+   * 4. Daily overtime capped at max_overtime_daily_hours
+   * 5. Global overtime enable/disable switch
    */
   static computeAttendanceHoursBreakdown(
     workspaceId: number,
     dateStr: string,
     checkInTimeStr: string,
     checkOutTimeStr: string,
-    session?: string
+    session?: string,
+    hasApprovedEarlyWork: boolean = false
   ) {
     const effective = this.getEffectiveWorkStatus(workspaceId, dateStr, checkInTimeStr, session);
     const multipliers = this.getOvertimeMultipliers(workspaceId);
 
-    // Calculate elapsed hours between check-in and check-out
-    const [inH, inM] = checkInTimeStr.split(":").map(Number);
-    const [outH, outM] = checkOutTimeStr.split(":").map(Number);
-    
-    let inMinutes = inH * 60 + (inM || 0);
-    let outMinutes = outH * 60 + (outM || 0);
+    // Fetch workspace settings
+    const settings: any = db.prepare("SELECT * FROM site_settings WHERE workspace_id = ?").get(workspaceId) || {};
+
+    const settingToEthMinutes = (timeStr?: string, defaultVal: number = 0): number => {
+      if (!timeStr) return defaultVal;
+      const parts = timeStr.trim().split(":");
+      const h = parseInt(parts[0], 10);
+      const m = parseInt(parts[1] || "0", 10);
+      if (isNaN(h)) return defaultVal;
+      // Convert 24-hr Gregorian ("08:30" -> 02:30 Ethiopian / 150 mins)
+      const ethH = (h >= 6 && h <= 23) ? ((h - 6 + 24) % 24) : h;
+      return ethH * 60 + m;
+    };
+
+    const punchToEthMinutes = (timeStr?: string, defaultVal: number = 0): number => {
+      if (!timeStr) return defaultVal;
+      const parts = timeStr.trim().split(":");
+      let h = parseInt(parts[0], 10);
+      const m = parseInt(parts[1] || "0", 10);
+      if (isNaN(h)) return defaultVal;
+      if (h >= 13) {
+        h = (h - 6 + 24) % 24;
+      }
+      return h * 60 + m;
+    };
+
+    const inMinutes = punchToEthMinutes(checkInTimeStr, 150);
+    let outMinutes = punchToEthMinutes(checkOutTimeStr, 390);
     if (outMinutes < inMinutes) {
       outMinutes += 24 * 60; // Crosses midnight
     }
-    const totalHours = Math.max(0, Number(((outMinutes - inMinutes) / 60).toFixed(2)));
+
+    const totalElapsedHours = Math.max(0, Number(((outMinutes - inMinutes) / 60).toFixed(2)));
+
+    // Settings rules
+    const overtimeEnabled = (settings?.overtime_enabled ?? 1) === 1;
+    const minOtMinutes = Number(settings?.min_overtime_minutes ?? 30);
+    const maxDailyOt = Number(settings?.max_overtime_daily_hours ?? 4.0);
+    const earlyArrivalAsOvertime = (settings?.early_arrival_as_overtime ?? 0) === 1;
+    const earlyOtRequiresApproval = (settings?.early_overtime_requires_approval ?? 1) === 1;
+
+    // Normal session scheduled start & end in Ethiopian clock minutes
+    let normalStartMins = 150; // Default 02:30 (08:30 AM)
+    let normalEndMins = 390;   // Default 06:30 (12:30 PM)
+
+    if (session === "Morning") {
+      normalStartMins = settingToEthMinutes(settings?.morning_start_time, 150);
+      normalEndMins = settingToEthMinutes(settings?.morning_end_time, 390);
+    } else if (session === "Afternoon") {
+      normalStartMins = settingToEthMinutes(settings?.afternoon_start_time, 450);
+      normalEndMins = settingToEthMinutes(settings?.afternoon_end_time, 690);
+    } else {
+      normalStartMins = settingToEthMinutes(settings?.work_start_time, 150);
+      normalEndMins = settingToEthMinutes(settings?.work_end_time, 690);
+    }
+
+    const standardDuration = Math.max(0, Number(((normalEndMins - normalStartMins) / 60).toFixed(2)));
 
     let regularHours = 0;
     let overtimeHours = 0;
@@ -255,45 +309,77 @@ export class WorkCalendarService {
     let multiplier = 1.0;
 
     if (effective.attendanceType === "HOLIDAY_OVERTIME") {
-      // 100% of hours worked on a Holiday are Holiday Overtime
-      attendanceType = "HOLIDAY_OVERTIME";
-      holidayOvertimeHours = totalHours;
-      overtimeHours = totalHours;
-      multiplier = multipliers.holiday;
+      if (overtimeEnabled) {
+        attendanceType = "HOLIDAY_OVERTIME";
+        overtimeHours = Math.min(totalElapsedHours, maxDailyOt);
+        holidayOvertimeHours = overtimeHours;
+        multiplier = multipliers.holiday;
+        regularHours = 0;
+      } else {
+        regularHours = totalElapsedHours;
+        overtimeHours = 0;
+        multiplier = 1.0;
+      }
     } else if (effective.attendanceType === "REST_DAY_OVERTIME") {
-      // 100% of hours worked on a Rest Day / Non-working day are Rest Day Overtime
-      attendanceType = "REST_DAY_OVERTIME";
-      restDayOvertimeHours = totalHours;
-      overtimeHours = totalHours;
-      multiplier = multipliers.rest_day;
+      if (overtimeEnabled) {
+        attendanceType = "REST_DAY_OVERTIME";
+        overtimeHours = Math.min(totalElapsedHours, maxDailyOt);
+        restDayOvertimeHours = overtimeHours;
+        multiplier = multipliers.rest_day;
+        regularHours = 0;
+      } else {
+        regularHours = totalElapsedHours;
+        overtimeHours = 0;
+        multiplier = 1.0;
+      }
     } else {
-      // Regular Workday in Ethiopian Local Time:
-      // Morning shift: 02:00 to 06:00 (Standard: 4.0 hours)
-      // Afternoon shift: 07:00 to 11:00 (Standard: 4.0 hours)
-      // Any session hours beyond 4.0 hours (or full day beyond 8.0 hours) are Overtime
-      const maxSessionRegularHours = session ? 4.0 : 8.0;
-      
-      // Night overtime for hours beyond 04:00 night (22:00 Gregorian / 10 PM)
-      const nightStartMinutes = 22 * 60; // 22:00 Gregorian
-      if (outMinutes > nightStartMinutes) {
-        const nightMins = outMinutes - Math.max(inMinutes, nightStartMinutes);
+      // Regular Workday:
+      // 1. Regular hours within scheduled shift window:
+      const regStartMins = Math.max(inMinutes, normalStartMins);
+      const regEndMins = Math.min(outMinutes, normalEndMins);
+      if (regEndMins > regStartMins) {
+        regularHours = Math.min(standardDuration, Number(((regEndMins - regStartMins) / 60).toFixed(2)));
+      }
+
+      // 2. Early arrival:
+      // Physical presence before normal check-in time does NOT automatically grant overtime.
+      // Treated as overtime ONLY if explicitly authorized/approved or configured.
+      let earlyOtHours = 0;
+      if (inMinutes < normalStartMins && overtimeEnabled) {
+        if (hasApprovedEarlyWork || (earlyArrivalAsOvertime && !earlyOtRequiresApproval)) {
+          const earlyMins = normalStartMins - inMinutes;
+          if (earlyMins >= minOtMinutes) {
+            earlyOtHours = Number((earlyMins / 60).toFixed(2));
+          }
+        }
+      }
+
+      // 3. Post-shift overtime (work after normal schedule):
+      let postOtHours = 0;
+      if (outMinutes > normalEndMins && overtimeEnabled) {
+        const postMins = outMinutes - normalEndMins;
+        if (postMins >= minOtMinutes) {
+          postOtHours = Number((postMins / 60).toFixed(2));
+        }
+      }
+
+      // 4. Night overtime for hours beyond 22:00 Gregorian (16:00 Ethiopian clock / 960 mins):
+      const nightStartMinutes = 16 * 60; // 22:00 Gregorian
+      if (outMinutes > nightStartMinutes && overtimeEnabled) {
+        const nightMins = outMinutes - Math.max(normalEndMins, nightStartMinutes);
         nightOvertimeHours = Math.max(0, Number((nightMins / 60).toFixed(2)));
       }
 
-      if (totalHours <= maxSessionRegularHours) {
-        regularHours = totalHours;
-        overtimeHours = 0;
-        regularOvertimeHours = 0;
-        attendanceType = "REGULAR_WORK";
-      } else {
-        regularHours = maxSessionRegularHours;
-        const excess = Math.max(0, Number((totalHours - regularHours).toFixed(2)));
-        regularOvertimeHours = Number(Math.max(0, excess - nightOvertimeHours).toFixed(2));
-        overtimeHours = excess;
-        attendanceType = excess > 0 ? "REGULAR_OVERTIME" : "REGULAR_WORK";
-        multiplier = multipliers.normal;
-      }
+      // 5. Total daily overtime capped at max_overtime_daily_hours:
+      const rawOt = earlyOtHours + postOtHours;
+      overtimeHours = Math.min(rawOt, maxDailyOt);
+      regularOvertimeHours = Math.max(0, Number((overtimeHours - nightOvertimeHours).toFixed(2)));
+
+      attendanceType = overtimeHours > 0 ? "REGULAR_OVERTIME" : "REGULAR_WORK";
+      multiplier = multipliers.normal;
     }
+
+    const totalHours = Number((regularHours + overtimeHours).toFixed(2));
 
     return {
       totalHours,

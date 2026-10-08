@@ -28,33 +28,116 @@ export interface PreFlightCheckResult {
 
 export class AttendanceService {
   /**
-   * Fetch site settings for workspace with defaults
+   * Fetch site settings for workspace with defaults (Single Source of Truth)
    */
   static getSiteSettings(workspaceId: number = 1): any {
     try {
       const settings: any = db.prepare("SELECT * FROM site_settings WHERE workspace_id = ?").get(workspaceId);
       return {
-        late_grace_minutes: settings?.late_grace_minutes ?? 15,
-        allowed_minor_lates: settings?.allowed_minor_lates ?? 2,
-        late_penalty_fixed_amount: settings?.late_penalty_fixed_amount ?? 25.0,
-        late_penalty_hourly_multiplier: settings?.late_penalty_hourly_multiplier ?? 0.5,
-        punctuality_bonus_amount: settings?.punctuality_bonus_amount ?? 500,
-        max_shift_duration_hours: settings?.max_shift_duration_hours ?? 14,
-        office_name: settings?.office_name || "Apex Main Office",
+        id: settings?.id,
+        workspace_id: settings?.workspace_id || workspaceId,
+        office_name: settings?.office_name || "Main Office",
+        latitude: settings?.latitude ?? 9.0227,
+        longitude: settings?.longitude ?? 38.7460,
+        office_wifi_ssid: settings?.office_wifi_ssid || "Office_WiFi",
+        office_wifi_bssid: settings?.office_wifi_bssid || "00:11:22:33:44:55",
+        wifi_ssid: settings?.wifi_ssid || "Office_WiFi",
+        wifi_ip: settings?.wifi_ip || "",
         use_wifi_verification: settings?.use_wifi_verification ?? 1,
-        allowed_radius_meters: settings?.allowed_radius_meters ?? 100
+        allowed_radius: settings?.allowed_radius ?? 35.0,
+        allowed_radius_meters: settings?.allowed_radius ?? 35.0,
+
+        // 1. Regular Work Schedule
+        work_start_time: settings?.work_start_time || "08:30",
+        work_end_time: settings?.work_end_time || "17:30",
+        required_daily_hours: Number(settings?.required_daily_hours ?? 8.0),
+        morning_start_time: settings?.morning_start_time || "08:30",
+        morning_end_time: settings?.morning_end_time || "12:30",
+        afternoon_start_time: settings?.afternoon_start_time || "13:30",
+        afternoon_end_time: settings?.afternoon_end_time || "17:30",
+
+        // 2. Check-in Rules
+        earliest_checkin_time: settings?.earliest_checkin_time || "07:00",
+        latest_checkin_time: settings?.latest_checkin_time || "10:30",
+        late_grace_minutes: Number(settings?.late_grace_minutes ?? 15),
+        allowed_minor_lates: Number(settings?.allowed_minor_lates ?? 2),
+        prevent_duplicate_checkin: Number(settings?.prevent_duplicate_checkin ?? 1),
+        early_arrival_as_overtime: Number(settings?.early_arrival_as_overtime ?? 0),
+        authorized_early_overtime_enabled: Number(settings?.authorized_early_overtime_enabled ?? 1),
+        early_overtime_requires_approval: Number(settings?.early_overtime_requires_approval ?? 1),
+
+        // 3. Check-out Rules
+        earliest_checkout_time: settings?.earliest_checkout_time || "16:30",
+        latest_checkout_time: settings?.latest_checkout_time || "20:00",
+        checkout_grace_minutes: Number(settings?.checkout_grace_minutes ?? 30),
+        prevent_checkout_without_checkin: Number(settings?.prevent_checkout_without_checkin ?? 1),
+        prevent_duplicate_checkout: Number(settings?.prevent_duplicate_checkout ?? 1),
+        missing_checkout_auto_overtime: Number(settings?.missing_checkout_auto_overtime ?? 0),
+
+        // 4. Overtime Rules
+        overtime_enabled: Number(settings?.overtime_enabled ?? 1),
+        overtime_start_time: settings?.overtime_start_time || "17:30",
+        min_overtime_minutes: Number(settings?.min_overtime_minutes ?? 30),
+        max_overtime_daily_hours: Number(settings?.max_overtime_daily_hours ?? 4.0),
+        max_overtime_weekly_hours: Number(settings?.max_overtime_weekly_hours ?? 12.0),
+        require_overtime_approval: Number(settings?.require_overtime_approval ?? 1),
+        normal_overtime_multiplier: Number(settings?.normal_overtime_multiplier ?? 1.5),
+        rest_day_overtime_multiplier: Number(settings?.rest_day_overtime_multiplier ?? 2.0),
+        holiday_overtime_multiplier: Number(settings?.holiday_overtime_multiplier ?? 2.5),
+        night_overtime_multiplier: Number(settings?.night_overtime_multiplier ?? 1.5),
+
+        // Penalties & Salary Calculation
+        late_penalty_fixed_amount: Number(settings?.late_penalty_fixed_amount ?? 25.0),
+        late_penalty_hourly_multiplier: Number(settings?.late_penalty_hourly_multiplier ?? 0.5),
+        punctuality_bonus_amount: Number(settings?.punctuality_bonus_amount ?? 500.0),
+        max_shift_duration_hours: Number(settings?.max_shift_duration_hours ?? 14.0),
+        default_salary_calculation: settings?.default_salary_calculation || "GROSS"
       };
     } catch (e) {
       return {
+        workspace_id: workspaceId,
+        office_name: "Main Office",
+        latitude: 9.0227,
+        longitude: 38.7460,
+        allowed_radius: 35.0,
+        allowed_radius_meters: 35.0,
+        use_wifi_verification: 1,
+        work_start_time: "08:30",
+        work_end_time: "17:30",
+        required_daily_hours: 8.0,
+        morning_start_time: "08:30",
+        morning_end_time: "12:30",
+        afternoon_start_time: "13:30",
+        afternoon_end_time: "17:30",
+        earliest_checkin_time: "07:00",
+        latest_checkin_time: "10:30",
         late_grace_minutes: 15,
         allowed_minor_lates: 2,
+        prevent_duplicate_checkin: 1,
+        early_arrival_as_overtime: 0,
+        authorized_early_overtime_enabled: 1,
+        early_overtime_requires_approval: 1,
+        earliest_checkout_time: "16:30",
+        latest_checkout_time: "20:00",
+        checkout_grace_minutes: 30,
+        prevent_checkout_without_checkin: 1,
+        prevent_duplicate_checkout: 1,
+        missing_checkout_auto_overtime: 0,
+        overtime_enabled: 1,
+        overtime_start_time: "17:30",
+        min_overtime_minutes: 30,
+        max_overtime_daily_hours: 4.0,
+        max_overtime_weekly_hours: 12.0,
+        require_overtime_approval: 1,
+        normal_overtime_multiplier: 1.5,
+        rest_day_overtime_multiplier: 2.0,
+        holiday_overtime_multiplier: 2.5,
+        night_overtime_multiplier: 1.5,
         late_penalty_fixed_amount: 25.0,
         late_penalty_hourly_multiplier: 0.5,
-        punctuality_bonus_amount: 500,
-        max_shift_duration_hours: 14,
-        office_name: "Apex Main Office",
-        use_wifi_verification: 1,
-        allowed_radius_meters: 100
+        punctuality_bonus_amount: 500.0,
+        max_shift_duration_hours: 14.0,
+        default_salary_calculation: "GROSS"
       };
     }
   }
@@ -62,22 +145,23 @@ export class AttendanceService {
   /**
    * Determine whether a check-in time is considered Late given grace period
    * In Ethiopian time format (HH:mm:ss):
-   * Morning shift standard start: 02:00 (08:00 Gregorian) or 02:30 (08:30 Gregorian)
-   * Afternoon shift standard start: 07:00 (13:00 Gregorian) or 07:30 (13:30 Gregorian)
+   * Respects configured session start times from site_settings.
    */
   static evaluateLateness(
     session: "Morning" | "Afternoon",
     ethiopianTimeStr: string,
-    lateGraceMinutes: number = 15
+    lateGraceMinutes: number = 15,
+    customStartMins?: number
   ): { isLate: boolean; lateMinutes: number; isWithinGracePeriod?: boolean } {
     try {
       const [h, m] = ethiopianTimeStr.split(":").map(Number);
-      const nowTotalMins = h * 60 + (m || 0);
+      const nowTotalMins = (h || 0) * 60 + (m || 0);
 
-      // In Ethiopian clock:
-      // Morning start = 02:00 (120 mins). With grace e.g. 15 mins -> 135 mins (02:15)
-      // Afternoon start = 07:00 (420 mins). With grace e.g. 15 mins -> 435 mins (07:15)
-      const baseStartMins = session === "Morning" ? 120 : 420;
+      // Default baseline in Ethiopian clock: Morning = 02:00 or 02:30 (120-150 mins), Afternoon = 07:00 or 07:30 (420-450 mins)
+      let baseStartMins = customStartMins;
+      if (baseStartMins === undefined || baseStartMins === null) {
+        baseStartMins = session === "Morning" ? 150 : 450; // Default 02:30 / 07:30
+      }
       const graceCutoffMins = baseStartMins + lateGraceMinutes;
 
       if (nowTotalMins > graceCutoffMins) {

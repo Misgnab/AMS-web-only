@@ -50,6 +50,40 @@ export interface SiteSettings {
   punctuality_bonus_amount?: number;
   max_shift_duration_hours?: number;
   default_salary_calculation?: "GROSS" | "NET";
+
+  // Regular Work Schedule Settings
+  work_start_time?: string; // e.g. "08:30"
+  work_end_time?: string; // e.g. "17:30"
+  required_daily_hours?: number; // e.g. 8.0
+  morning_start_time?: string; // e.g. "08:30"
+  morning_end_time?: string; // e.g. "12:30"
+  afternoon_start_time?: string; // e.g. "13:30"
+  afternoon_end_time?: string; // e.g. "17:30"
+
+  // Check-in Rules
+  earliest_checkin_time?: string; // e.g. "07:00"
+  latest_checkin_time?: string; // e.g. "10:30"
+  prevent_duplicate_checkin?: number | boolean;
+  early_arrival_as_overtime?: number | boolean; // default false: arriving early != overtime
+  authorized_early_overtime_enabled?: number | boolean;
+  early_overtime_requires_approval?: number | boolean;
+
+  // Check-out Rules
+  earliest_checkout_time?: string; // e.g. "16:30"
+  latest_checkout_time?: string; // e.g. "20:00"
+  checkout_grace_minutes?: number;
+  prevent_checkout_without_checkin?: number | boolean;
+  prevent_duplicate_checkout?: number | boolean;
+  missing_checkout_auto_overtime?: number | boolean; // default false: missing checkout NEVER creates overtime
+
+  // Overtime Rules & Policies
+  overtime_enabled?: number | boolean;
+  overtime_start_time?: string; // e.g. "17:30"
+  min_overtime_minutes?: number;
+  max_overtime_daily_hours?: number;
+  max_overtime_weekly_hours?: number;
+  require_overtime_approval?: number | boolean;
+
   updated_at?: string;
 }
 

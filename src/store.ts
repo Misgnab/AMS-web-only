@@ -157,6 +157,7 @@ interface AppState {
   fetchQRCode: () => Promise<void>;
   fetchSiteSettings: () => Promise<void>;
   updateSiteSettings: (data: Partial<SiteSettings>) => Promise<boolean>;
+  saveAttendanceSettings: (data: Partial<SiteSettings> & { weekly_schedule?: WorkScheduleDay[] }) => Promise<{ success: boolean; error?: string }>;
 
   // Work Calendar, Holidays & Overtime Actions
   fetchWorkCalendar: () => Promise<void>;
@@ -1164,6 +1165,34 @@ export const useAppStore = create<AppState>((set, get) => ({
     } catch (err) {
       console.error("Error updating site settings:", err);
       return false;
+    }
+  },
+
+  saveAttendanceSettings: async (data) => {
+    const { token } = get();
+    if (!token) return { success: false, error: "Authentication required" };
+    try {
+      const res = await authenticatedFetch("/api/site-settings", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(data)
+      }, () => get().logout());
+      const body = await safeJson(res);
+      if (res.ok) {
+        if (body?.settings) {
+          set({ siteSettings: body.settings });
+        } else {
+          await get().fetchSiteSettings();
+        }
+        if (data.weekly_schedule) {
+          await get().fetchWorkCalendar();
+        }
+        return { success: true };
+      }
+      return { success: false, error: body?.error || "Failed to update attendance settings" };
+    } catch (err: any) {
+      console.error("Error updating attendance settings:", err);
+      return { success: false, error: err.message || "Failed to update attendance settings" };
     }
   },
 
