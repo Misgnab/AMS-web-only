@@ -254,20 +254,51 @@ export class WorkCalendarService {
       return ethH * 60 + m;
     };
 
-    const punchToEthMinutes = (timeStr?: string, defaultVal: number = 0): number => {
+    const punchToEthMinutes = (timeStr?: string, defaultVal: number = 0, sess?: string): number => {
       if (!timeStr) return defaultVal;
       const parts = timeStr.trim().split(":");
       let h = parseInt(parts[0], 10);
       const m = parseInt(parts[1] || "0", 10);
       if (isNaN(h)) return defaultVal;
-      if (h >= 13) {
-        h = (h - 6 + 24) % 24;
+
+      if (sess === "Morning") {
+        // Ethiopian morning is 01..06. Gregorian morning is 07..12.
+        if (h >= 7 && h <= 12) {
+          h = h - 6;
+        }
+      } else if (sess === "Afternoon") {
+        // Ethiopian afternoon is 07..12. Gregorian afternoon is 13..23.
+        if (h >= 13) {
+          h = (h - 6 + 24) % 24;
+        }
+      } else {
+        // Full day / Unspecified:
+        if (h >= 6 && h <= 12) {
+          h = h - 6;
+        } else if (h >= 13) {
+          h = (h - 6 + 24) % 24;
+        }
       }
       return h * 60 + m;
     };
 
-    const inMinutes = punchToEthMinutes(checkInTimeStr, 150);
-    let outMinutes = punchToEthMinutes(checkOutTimeStr, 390);
+    // Normal session scheduled start & end in Ethiopian clock minutes from workspace settings
+    let normalStartMins = 150; // Default 02:30 (08:30 AM)
+    let normalEndMins = 390;   // Default 06:30 (12:30 PM)
+
+    if (session === "Morning") {
+      normalStartMins = settingToEthMinutes(settings?.morning_start_time || settings?.work_start_time, 150);
+      normalEndMins = settingToEthMinutes(settings?.morning_end_time, 390);
+    } else if (session === "Afternoon") {
+      normalStartMins = settingToEthMinutes(settings?.afternoon_start_time, 450);
+      normalEndMins = settingToEthMinutes(settings?.afternoon_end_time || settings?.work_end_time, 690);
+    } else {
+      normalStartMins = settingToEthMinutes(settings?.work_start_time, 150);
+      normalEndMins = settingToEthMinutes(settings?.work_end_time, 690);
+    }
+
+    const inMinutes = punchToEthMinutes(checkInTimeStr, normalStartMins, session);
+    let outMinutes = punchToEthMinutes(checkOutTimeStr, normalEndMins, session);
     if (outMinutes < inMinutes) {
       outMinutes += 24 * 60; // Crosses midnight
     }
@@ -280,21 +311,6 @@ export class WorkCalendarService {
     const maxDailyOt = Number(settings?.max_overtime_daily_hours ?? 4.0);
     const earlyArrivalAsOvertime = (settings?.early_arrival_as_overtime ?? 0) === 1;
     const earlyOtRequiresApproval = (settings?.early_overtime_requires_approval ?? 1) === 1;
-
-    // Normal session scheduled start & end in Ethiopian clock minutes
-    let normalStartMins = 150; // Default 02:30 (08:30 AM)
-    let normalEndMins = 390;   // Default 06:30 (12:30 PM)
-
-    if (session === "Morning") {
-      normalStartMins = settingToEthMinutes(settings?.morning_start_time, 150);
-      normalEndMins = settingToEthMinutes(settings?.morning_end_time, 390);
-    } else if (session === "Afternoon") {
-      normalStartMins = settingToEthMinutes(settings?.afternoon_start_time, 450);
-      normalEndMins = settingToEthMinutes(settings?.afternoon_end_time, 690);
-    } else {
-      normalStartMins = settingToEthMinutes(settings?.work_start_time, 150);
-      normalEndMins = settingToEthMinutes(settings?.work_end_time, 690);
-    }
 
     const standardDuration = Math.max(0, Number(((normalEndMins - normalStartMins) / 60).toFixed(2)));
 
@@ -354,10 +370,15 @@ export class WorkCalendarService {
         }
       }
 
-      // 3. Post-shift overtime (work after normal schedule):
+      // 3. Post-shift overtime (work after normal schedule and configured overtime start time):
       let postOtHours = 0;
-      if (outMinutes > normalEndMins && overtimeEnabled) {
-        const postMins = outMinutes - normalEndMins;
+      const configuredOtStartMins = (session === "Afternoon" || !session) && settings?.overtime_start_time
+        ? settingToEthMinutes(settings.overtime_start_time, normalEndMins)
+        : normalEndMins;
+      const effectiveOtThreshold = Math.max(normalEndMins, configuredOtStartMins);
+
+      if (outMinutes > effectiveOtThreshold && overtimeEnabled) {
+        const postMins = outMinutes - effectiveOtThreshold;
         if (postMins >= minOtMinutes) {
           postOtHours = Number((postMins / 60).toFixed(2));
         }

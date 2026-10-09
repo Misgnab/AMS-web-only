@@ -1,5 +1,6 @@
 import { db } from "./database.ts";
 import { WorkCalendarService } from "./workCalendarService.ts";
+import { formatToEthiopianTime } from "../utils/ethiopianTime.ts";
 import type { AttendanceRecord, AttendanceCorrection, SiteSettings } from "../types.ts";
 
 export interface AttendanceExceptionItem {
@@ -143,6 +144,52 @@ export class AttendanceService {
   }
 
   /**
+   * Determine the effective hourly rate for an employee.
+   * If the employee has monthly_base_salary > 0, calculates derived rate via Ethiopian Labour
+   * Proclamation standards: 26 working days * 8 hours = 208 hours per month.
+   * Otherwise falls back to their registered hourly_rate (or standard 150.00 baseline if unset).
+   */
+  static getEmployeeEffectiveHourlyRate(
+    user: { hourly_rate?: number | string | null; monthly_base_salary?: number | string | null } | null | undefined,
+    fallbackRate: number = 150.0
+  ): number {
+    if (!user) return fallbackRate;
+    const monthlySalary = typeof user.monthly_base_salary === "number"
+      ? user.monthly_base_salary
+      : parseFloat(String(user.monthly_base_salary || 0));
+
+    if (monthlySalary > 0) {
+      const derived = Math.round((monthlySalary / 208) * 100) / 100;
+      if (derived > 0) return derived;
+    }
+
+    const hourly = typeof user.hourly_rate === "number"
+      ? user.hourly_rate
+      : parseFloat(String(user.hourly_rate || 0));
+
+    if (hourly > 0) {
+      return Math.round(hourly * 100) / 100;
+    }
+
+    return fallbackRate;
+  }
+
+  /**
+   * Calculate late penalty amount dynamically from employee's actual hourly rate and workspace policy.
+   * Formula: fixed_incident_penalty + (late_minutes / 60) * employee_hourly_rate * late_penalty_hourly_multiplier
+   */
+  static calculateLatePenaltyAmount(
+    lateMinutes: number,
+    employeeHourlyRate: number,
+    fixedPenalty: number = 25.0,
+    hourlyMultiplier: number = 0.5
+  ): number {
+    if (lateMinutes <= 0) return 0.0;
+    const timeDeduction = (lateMinutes / 60) * employeeHourlyRate * hourlyMultiplier;
+    return Math.round((fixedPenalty + timeDeduction) * 100) / 100;
+  }
+
+  /**
    * Determine whether a check-in time is considered Late given grace period
    * In Ethiopian time format (HH:mm:ss):
    * Respects configured session start times from site_settings.
@@ -151,16 +198,24 @@ export class AttendanceService {
     session: "Morning" | "Afternoon",
     ethiopianTimeStr: string,
     lateGraceMinutes: number = 15,
-    customStartMins?: number
+    customStartMins?: number,
+    workspaceId: number = 1
   ): { isLate: boolean; lateMinutes: number; isWithinGracePeriod?: boolean } {
     try {
       const [h, m] = ethiopianTimeStr.split(":").map(Number);
       const nowTotalMins = (h || 0) * 60 + (m || 0);
 
-      // Default baseline in Ethiopian clock: Morning = 02:00 or 02:30 (120-150 mins), Afternoon = 07:00 or 07:30 (420-450 mins)
       let baseStartMins = customStartMins;
       if (baseStartMins === undefined || baseStartMins === null) {
-        baseStartMins = session === "Morning" ? 150 : 450; // Default 02:30 / 07:30
+        const settings = this.getSiteSettings(workspaceId);
+        const startStr = session === "Morning" 
+          ? (settings.morning_start_time || settings.work_start_time || "08:30") 
+          : (settings.afternoon_start_time || "13:30");
+        const parts = startStr.trim().split(":");
+        const sh = parseInt(parts[0], 10);
+        const sm = parseInt(parts[1] || "0", 10);
+        const ethH = (sh >= 6 && sh <= 23) ? ((sh - 6 + 24) % 24) : sh;
+        baseStartMins = ethH * 60 + sm;
       }
       const graceCutoffMins = baseStartMins + lateGraceMinutes;
 
@@ -181,6 +236,7 @@ export class AttendanceService {
 
   /**
    * Idempotent evaluation of attendance exceptions, unclosed shifts, and missing attendance
+   * Authoritatively reads session windows and cutoff grace periods from site_settings database.
    */
   static evaluateAttendanceExceptionsAndShifts(
     workspaceId: number = 1,
@@ -193,6 +249,24 @@ export class AttendanceService {
     try {
       const settings = this.getSiteSettings(workspaceId);
       const maxDurationHours = settings.max_shift_duration_hours || 14;
+
+      const parseSettingEthMins = (timeStr?: string, defaultMins: number = 0): number => {
+        if (!timeStr) return defaultMins;
+        const [hStr, mStr] = timeStr.trim().split(":");
+        const h = parseInt(hStr, 10);
+        const m = parseInt(mStr || "0", 10);
+        if (isNaN(h)) return defaultMins;
+        const ethH = (h >= 6 && h <= 23) ? ((h - 6 + 24) % 24) : h;
+        return ethH * 60 + m;
+      };
+
+      const morningEndEthMins = parseSettingEthMins(settings.morning_end_time, 390);
+      const morningCutoffMins = morningEndEthMins + (settings.checkout_grace_minutes || 0);
+
+      const afternoonEndEthMins = parseSettingEthMins(settings.afternoon_end_time || settings.work_end_time, 690);
+      const afternoonCutoffMins = settings.latest_checkout_time 
+        ? parseSettingEthMins(settings.latest_checkout_time, 720) 
+        : afternoonEndEthMins + (settings.checkout_grace_minutes || 0);
 
       // 1. Find all unclosed shifts from past dates (or today where elapsed time > maxDurationHours)
       const openRecords: any[] = db.prepare(`
@@ -218,18 +292,12 @@ export class AttendanceService {
           const [nowH, nowM] = nowTimeStr.split(":").map(Number);
           const nowTotalMins = (nowH || 0) * 60 + (nowM || 0);
 
-          // STRICT SESSION CHECKOUT RULES FOR BOTH MORNING AND AFTERNOON:
-          // 1. Morning Session: Scheduled 02:00 to 06:30 (08:00 AM to 12:30 PM).
-          // Cutoff window: 06:30 (390 mins). Once morning shift concludes or afternoon starts,
-          // unclosed Morning check-in MUST be strictly marked as Missing Checkout!
-          if (record.session === "Morning" && (nowTotalMins >= 390 || nowTimeStr >= "06:30:00")) {
+          // STRICT SESSION CHECKOUT RULES FOR BOTH MORNING AND AFTERNOON (DYNAMICALLY CONFIGURED):
+          if (record.session === "Morning" && nowTotalMins >= morningCutoffMins) {
             shouldFlag = true;
           }
 
-          // 2. Afternoon Session: Scheduled 07:00 to 11:30 (01:00 PM to 05:30 PM).
-          // Cutoff window: 12:00 (720 mins / 18:00 Gregorian). Once evening shift cutoff arrives,
-          // unclosed Afternoon check-in MUST be strictly marked as Missing Checkout!
-          if (record.session === "Afternoon" && (nowTotalMins >= 720 || nowTimeStr >= "12:00:00")) {
+          if (record.session === "Afternoon" && nowTotalMins >= afternoonCutoffMins) {
             shouldFlag = true;
           }
 
@@ -616,7 +684,7 @@ export class AttendanceService {
       }
 
       const employeeId = correction.employee_id || correction.user_id;
-      const employee: any = db.prepare("SELECT id, full_name, phone_number, workspace_id, role FROM users WHERE id = ?").get(employeeId);
+      const employee: any = db.prepare("SELECT id, full_name, phone_number, workspace_id, role, hourly_rate, monthly_base_salary FROM users WHERE id = ?").get(employeeId);
       const workspaceId = employee?.workspace_id || adminUser?.workspace_id || 1;
 
       // Determine final times
@@ -646,12 +714,26 @@ export class AttendanceService {
         }
       }
 
+      const settings = this.getSiteSettings(workspaceId);
+      const defaultStartEth = formatToEthiopianTime(
+        correction.session === "Morning" 
+          ? (settings.morning_start_time || settings.work_start_time) 
+          : settings.afternoon_start_time
+      );
+      const defaultEndEth = formatToEthiopianTime(
+        correction.session === "Morning" 
+          ? settings.morning_end_time 
+          : (settings.afternoon_end_time || settings.work_end_time)
+      );
+      const defaultInStr = `${String(defaultStartEth.ethHour).padStart(2, "0")}:${defaultStartEth.minute}:00`;
+      const defaultOutStr = `${String(defaultEndEth.ethHour).padStart(2, "0")}:${defaultEndEth.minute}:00`;
+
       // Calculate hours breakdown using WorkCalendarService
       const breakdown = WorkCalendarService.computeAttendanceHoursBreakdown(
         workspaceId,
         correction.date,
-        finalIn || "02:00:00",
-        finalOut || "06:00:00",
+        finalIn || defaultInStr,
+        finalOut || defaultOutStr,
         correction.session
       );
 
@@ -661,8 +743,8 @@ export class AttendanceService {
       const workedMinutes = Math.round(totalHours * 60);
 
       // Determine attendance status and penalty
-      const settings = this.getSiteSettings(workspaceId);
-      const lateness = this.evaluateLateness(correction.session, finalIn || "02:00:00", settings.late_grace_minutes);
+      const scheduledStartEthMins = defaultStartEth.ethHour * 60 + parseInt(defaultStartEth.minute, 10);
+      const lateness = this.evaluateLateness(correction.session, finalIn || defaultInStr, settings.late_grace_minutes, scheduledStartEthMins, workspaceId);
 
       let finalStatus = "Present";
       let penaltyStatus: string | null = null;
@@ -672,10 +754,10 @@ export class AttendanceService {
       if (lateness.isLate) {
         finalStatus = "Late";
         penaltyStatus = "PENALIZED";
-        const empRate = employee?.hourly_rate || 45;
+        const empRate = this.getEmployeeEffectiveHourlyRate(employee);
         const fixedPenalty = settings.late_penalty_fixed_amount ?? 25.0;
         const hourlyMult = settings.late_penalty_hourly_multiplier ?? 0.5;
-        penaltyAmount = Math.round((fixedPenalty + ((lateMinutes / 60) * empRate * hourlyMult)) * 100) / 100;
+        penaltyAmount = this.calculateLatePenaltyAmount(lateMinutes, empRate, fixedPenalty, hourlyMult);
       } else if (lateness.isWithinGracePeriod) {
         penaltyStatus = "WITHIN_GRACE";
       } else if (totalHours < 3.75 && breakdown.attendanceType === "REGULAR_WORK") {
@@ -789,7 +871,7 @@ export class AttendanceService {
       // Sync with late_penalties table in database
       if (penaltyStatus === "PENALIZED" || penaltyStatus === "WITHIN_GRACE" || lateMinutes > 0) {
         const existingPen: any = db.prepare("SELECT id FROM late_penalties WHERE attendance_id = ?").get(targetAttId);
-        const scheduledStart = correction.session === "Morning" ? "02:00:00" : "07:00:00";
+        const scheduledStart = defaultInStr;
         if (existingPen) {
           db.prepare(`
             UPDATE late_penalties

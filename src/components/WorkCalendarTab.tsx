@@ -30,14 +30,19 @@ import {
   Filter,
   Lock,
   ShieldCheck,
-  Globe
+  Globe,
+  ChevronRight
 } from "lucide-react";
 
 interface WorkCalendarTabProps {
   readOnly?: boolean;
+  onNavigateToSettings?: () => void;
 }
 
-export const WorkCalendarTab: React.FC<WorkCalendarTabProps> = ({ readOnly = false }) => {
+export const WorkCalendarTab: React.FC<WorkCalendarTabProps> = ({ 
+  readOnly = false,
+  onNavigateToSettings
+}) => {
   const {
     workSchedules,
     holidays,
@@ -430,6 +435,28 @@ export const WorkCalendarTab: React.FC<WorkCalendarTabProps> = ({ readOnly = fal
                 </button>
               )}
             </div>
+
+            {!readOnly && onNavigateToSettings && (
+              <div className="p-4 bg-gradient-to-r from-blue-50 to-indigo-50 rounded-xl border border-blue-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div className="space-y-1">
+                  <span className="text-xs font-bold text-blue-900 flex items-center gap-1.5">
+                    <Clock size={14} className="text-blue-600" />
+                    Centralized Attendance & Work Schedule Settings (Single Source of Truth)
+                  </span>
+                  <p className="text-[11px] text-blue-700 leading-relaxed">
+                    Configure official company start/end times, check-in cutoff windows, grace periods, and overtime policy.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={onNavigateToSettings}
+                  className="px-3.5 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-bold transition shadow-sm shrink-0 flex items-center gap-1.5 self-start sm:self-center"
+                >
+                  <span>Schedule & Policy Settings</span>
+                  <ChevronRight size={14} />
+                </button>
+              </div>
+            )}
 
             {/* Quick Shift Presets Bar for Admins */}
             {!readOnly && (

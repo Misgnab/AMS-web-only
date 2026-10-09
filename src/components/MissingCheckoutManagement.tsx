@@ -34,6 +34,7 @@ import {
 } from "lucide-react";
 import { useAppStore } from "../store.js";
 import { AttendanceRecord, AttendanceCorrection, AuditLogRecord } from "../types.js";
+import { formatToEthiopianTime } from "../utils/ethiopianTime.js";
 
 export interface MissingCheckoutManagementProps {
  isModal?: boolean;
@@ -50,6 +51,7 @@ export const MissingCheckoutManagement: React.FC<MissingCheckoutManagementProps>
 }) => {
  const {
  user,
+ siteSettings,
  missingCheckouts,
  attendanceCorrections,
  attendanceAuditLogs,
@@ -192,13 +194,31 @@ export const MissingCheckoutManagement: React.FC<MissingCheckoutManagementProps>
  return Math.max(0, parseFloat((diff / 60).toFixed(2)));
  };
 
+ const getSettingDefaultIn = (session: string, isGreg: boolean) => {
+   const timeStr = session === "Morning" 
+     ? (siteSettings?.morning_start_time || siteSettings?.work_start_time || "08:30") 
+     : (siteSettings?.afternoon_start_time || "13:30");
+   if (isGreg) return timeStr.length === 5 ? `${timeStr}:00` : timeStr;
+   const eth = formatToEthiopianTime(timeStr);
+   return `${String(eth.ethHour).padStart(2, "0")}:${eth.minute}:00`;
+ };
+
+ const getSettingDefaultOut = (session: string, isGreg: boolean) => {
+   const timeStr = session === "Morning" 
+     ? (siteSettings?.morning_end_time || "12:30") 
+     : (siteSettings?.afternoon_end_time || siteSettings?.work_end_time || "17:30");
+   if (isGreg) return timeStr.length === 5 ? `${timeStr}:00` : timeStr;
+   const eth = formatToEthiopianTime(timeStr);
+   return `${String(eth.ethHour).padStart(2, "0")}:${eth.minute}:00`;
+ };
+
  const handleSelectUnclosedRecord = (record: AttendanceRecord) => {
  setSelectedUnclosedRecord(record);
  setMobileDetailView("detail");
  setFeedback(null);
  const isGreg = (record.check_in_time || "").startsWith("08") || (record.check_in_time || "").startsWith("13");
- setDirectCheckInTime(record.check_in_time || (record.session === "Morning" ? (isGreg ? "08:30:00" : "02:30:00") : (isGreg ? "13:30:00" : "07:30:00")));
- setDirectCheckOutTime(record.session === "Morning" ? (isGreg ? "12:30:00" : "06:30:00") : (isGreg ? "17:30:00" : "11:30:00"));
+ setDirectCheckInTime(record.check_in_time || getSettingDefaultIn(record.session, isGreg));
+ setDirectCheckOutTime(getSettingDefaultOut(record.session, isGreg));
  setDirectStatus("Present");
  setDirectReason("");
  setDirectCustomHours("");
@@ -209,7 +229,7 @@ export const MissingCheckoutManagement: React.FC<MissingCheckoutManagementProps>
  setMobileDetailView("detail");
  setFeedback(null);
  const isGreg = (record.check_in_time || "").startsWith("08") || (record.check_in_time || "").startsWith("13");
- setEmpRequestedCheckOut(record.session === "Morning" ? (isGreg ? "12:30:00" : "06:30:00") : (isGreg ? "17:30:00" : "11:30:00"));
+ setEmpRequestedCheckOut(getSettingDefaultOut(record.session, isGreg));
  setEmpReasonCode("FORGOT_CHECKOUT");
  setEmpReasonText("");
  };
@@ -218,26 +238,28 @@ export const MissingCheckoutManagement: React.FC<MissingCheckoutManagementProps>
  setSelectedCorrectionForReview(correction);
  setReviewActionType(action);
  const isGreg = (correction.original_check_in || correction.requested_check_in || "").startsWith("08") || (correction.original_check_in || "").startsWith("13");
- setApprovedCheckOutTime(correction.requested_check_out || (correction.session === "Morning" ? (isGreg ? "12:30:00" : "06:30:00") : (isGreg ? "17:30:00" : "11:30:00")));
+ setApprovedCheckOutTime(correction.requested_check_out || getSettingDefaultOut(correction.session, isGreg));
  setAdminReviewNotes("");
  setRejectionReasonInput("");
  setFeedback(null);
  };
 
  const computeDirectCalculatedHours = (): number => {
- if (directCustomHours && !isNaN(parseFloat(directCustomHours))) {
- return parseFloat(parseFloat(directCustomHours).toFixed(2));
- }
- const inTime = directCheckInTime || (selectedUnclosedRecord?.session === "Morning" ? "02:30:00" : "07:30:00");
- const outTime = directCheckOutTime || (selectedUnclosedRecord?.session === "Morning" ? "06:30:00" : "11:30:00");
- return computeShiftWorkedHours(inTime, outTime, selectedUnclosedRecord?.session);
+  if (directCustomHours && !isNaN(parseFloat(directCustomHours))) {
+    return parseFloat(parseFloat(directCustomHours).toFixed(2));
+  }
+  const sess = selectedUnclosedRecord?.session || "Morning";
+  const inTime = directCheckInTime || getSettingDefaultIn(sess, false);
+  const outTime = directCheckOutTime || getSettingDefaultOut(sess, false);
+  return computeShiftWorkedHours(inTime, outTime, sess);
  };
 
  const computeEmpCalculatedHours = (): number => {
- if (!selectedMyUnclosedRecord) return 4.0;
- const inTime = selectedMyUnclosedRecord.check_in_time || (selectedMyUnclosedRecord.session === "Morning" ? "02:30:00" : "07:30:00");
- const outTime = empRequestedCheckOut || (selectedMyUnclosedRecord.session === "Morning" ? "06:30:00" : "11:30:00");
- return computeShiftWorkedHours(inTime, outTime, selectedMyUnclosedRecord.session);
+  if (!selectedMyUnclosedRecord) return 4.0;
+  const sess = selectedMyUnclosedRecord.session || "Morning";
+  const inTime = selectedMyUnclosedRecord.check_in_time || getSettingDefaultIn(sess, false);
+  const outTime = empRequestedCheckOut || getSettingDefaultOut(sess, false);
+  return computeShiftWorkedHours(inTime, outTime, sess);
  };
 
  const handleDirectSubmit = async (e: React.FormEvent) => {

@@ -5,6 +5,7 @@ export interface User {
   role: "Bootstrap" | "AdminCreator" | "AdminManager" | "SuperAdmin" | "Employee" | "Purchaser" | "Accountant" | "Engineer" | "HR";
   photo?: string;
   hourly_rate: number;
+  effective_hourly_rate?: number;
   monthly_base_salary?: number;
   transport_allowance?: number;
   housing_allowance?: number;

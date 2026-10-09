@@ -192,14 +192,46 @@ export const AttendanceScheduleSettingsTab: React.FC = () => {
       errors.afternoonSchedule = "Afternoon session start must be earlier than afternoon session end.";
     }
 
+    if (morningEnd > afternoonStart) {
+      errors.morningSchedule = "Morning session end cannot be after Afternoon session start (break period overlap).";
+    }
+
+    const reqDaily = Number(formData.required_daily_hours || 0);
+    if (reqDaily > 10.0 || reqDaily <= 0) {
+      errors.workSchedule = "Under Ethiopian Labour Proclamation No. 1156/2019 Art. 61, regular daily work hours cannot exceed 8 to 10 hours.";
+    }
+
     const earliestCheckin = toMinutes(formData.earliest_checkin_time);
     if (earliestCheckin > workStart) {
       errors.checkIn = "Earliest allowed check-in time cannot be later than normal check-in time.";
     }
 
+    const latestCheckin = toMinutes(formData.latest_checkin_time);
+    if (latestCheckin > 0 && latestCheckin < workStart) {
+      errors.checkIn = "Latest allowed check-in cutoff cannot be earlier than normal check-in time.";
+    }
+
+    if (Number(formData.late_grace_minutes || 0) < 0) {
+      errors.checkIn = "Check-in grace period cannot be negative.";
+    }
+
     const earliestCheckout = toMinutes(formData.earliest_checkout_time);
     if (earliestCheckout > workEnd) {
       errors.checkOut = "Earliest allowed check-out cannot be after normal check-out time.";
+    }
+
+    const latestCheckout = toMinutes(formData.latest_checkout_time);
+    if (latestCheckout > 0 && latestCheckout < workEnd) {
+      errors.checkOut = "Latest allowed check-out cutoff cannot be earlier than normal check-out time.";
+    }
+
+    if (Number(formData.checkout_grace_minutes || 0) < 0) {
+      errors.checkOut = "Checkout grace period cannot be negative.";
+    }
+
+    const otStart = toMinutes(formData.overtime_start_time);
+    if (otStart > 0 && otStart < workEnd) {
+      errors.overtime = "Overtime start time cannot be earlier than normal work end time.";
     }
 
     const minOt = Number(formData.min_overtime_minutes || 0);
@@ -210,8 +242,16 @@ export const AttendanceScheduleSettingsTab: React.FC = () => {
       errors.overtime = "Minimum overtime duration cannot be negative.";
     } else if (maxOtDaily <= 0) {
       errors.overtime = "Maximum daily overtime must be greater than zero.";
+    } else if (maxOtDaily > 4.0) {
+      errors.overtime = "Under Ethiopian Labour Proclamation No. 1156/2019 Art. 67, daily overtime shall not exceed 4 hours.";
     } else if (maxOtWeekly < maxOtDaily) {
       errors.overtime = "Maximum weekly overtime cap cannot be lower than daily overtime cap.";
+    } else if (maxOtWeekly > 12.0) {
+      errors.overtime = "Under Ethiopian Labour Proclamation No. 1156/2019 Art. 67, weekly overtime shall not exceed 12 hours.";
+    }
+
+    if (Number(formData.normal_overtime_multiplier || 0) < 1.0) {
+      errors.overtime = "Overtime multiplier must be at least 1.0x (Labour Proclamation Art. 68 mandates 1.25x for standard overtime).";
     }
 
     return errors;

@@ -13,6 +13,8 @@ import {
   Moon
 } from "lucide-react";
 import { EffectiveWorkStatus } from "../types";
+import { useAppStore } from "../store";
+import { formatToEthiopianTime } from "../utils/ethiopianTime";
 
 interface WorkingDayStatusCardProps {
   status: EffectiveWorkStatus | null;
@@ -62,13 +64,19 @@ export const WorkingDayStatusCard: React.FC<WorkingDayStatusCardProps> = ({
     title = `Official Working Day (${status?.dayName || currentDayName})`;
   }
 
+  const { siteSettings } = useAppStore();
+  const mStartEth = formatToEthiopianTime(siteSettings?.morning_start_time || siteSettings?.work_start_time || "08:30").shortText;
+  const mEndEth = formatToEthiopianTime(siteSettings?.morning_end_time || "12:30").shortText;
+  const aStartEth = formatToEthiopianTime(siteSettings?.afternoon_start_time || "13:30").shortText;
+  const aEndEth = formatToEthiopianTime(siteSettings?.afternoon_end_time || siteSettings?.work_end_time || "17:30").shortText;
+
   const description = !isWorking
     ? (isHoliday 
         ? `Today is an official holiday: ${holidayName || "Public Holiday"}. Check-ins today are logged as Overtime (${otMultiplier}x rate).`
         : `Scheduled weekly rest day. Any hours worked will be logged as Rest Day Overtime (${otMultiplier}x rate).`)
     : (isSaturday
-        ? "Morning session (02:00 - 06:00 Ethiopian Time) is a working shift. Afternoon is scheduled off."
-        : "Standard business working hours apply. Morning: 02:00 – 06:00 | Afternoon: 07:00 – 11:00 (Ethiopian Local Time).");
+        ? `Morning session (${mStartEth} - ${mEndEth} Ethiopian Time) is a working shift. Afternoon is scheduled off.`
+        : `Standard business working hours apply. Morning: ${mStartEth} – ${mEndEth} | Afternoon: ${aStartEth} – ${aEndEth} (Ethiopian Local Time).`);
 
   if (compact) {
     return (

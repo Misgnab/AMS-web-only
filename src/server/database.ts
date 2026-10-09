@@ -1,6 +1,7 @@
 import crypto from "crypto";
 import bcrypt from "bcryptjs";
 import { db, databaseManager } from "./db/databaseManager.ts";
+import { AttendanceService } from "./attendanceService.ts";
 export { db, databaseManager };
 
 export function initDatabase() {
@@ -146,7 +147,7 @@ function seedInitialData() {
       const passwordHash = bcrypt.hashSync("admin123", 10);
       const res = db.prepare(`
         INSERT INTO users (full_name, phone_number, role, password, hourly_rate, workspace_id)
-        VALUES ('System Administrator', '0911223344', 'AdminCreator', ?, 45.00, 1)
+        VALUES ('System Administrator', '0911223344', 'AdminCreator', ?, 150.00, 1)
       `).run(passwordHash);
       const seededId = Number(res.lastInsertRowid);
       db.prepare("UPDATE workspaces SET created_by = ? WHERE id = 1 AND (created_by IS NULL OR created_by = 0)").run(seededId);
@@ -157,6 +158,10 @@ function seedInitialData() {
         `).run(seededId);
       } catch (_) {}
     } else {
+      // Migrate legacy 45.00 placeholder to standard rate
+      try {
+        db.prepare("UPDATE users SET hourly_rate = 150.00 WHERE id = ? AND hourly_rate = 45.00").run(existingDemoAdmin.id);
+      } catch (_) {}
       try {
         const firstAdmin: any = db.prepare("SELECT id FROM users WHERE role IN ('Bootstrap', 'AdminCreator', 'SuperAdmin') ORDER BY id ASC LIMIT 1").get();
         if (firstAdmin?.id) {
@@ -266,7 +271,7 @@ export function syncDatabaseOvertimeAndPenalties() {
   try {
     // 1. Sync and backfill late penalties into late_penalties table
     const lateRows = db.prepare(`
-      SELECT a.*, u.hourly_rate 
+      SELECT a.*, u.hourly_rate, u.monthly_base_salary 
       FROM attendance a
       JOIN users u ON a.user_id = u.id
       WHERE (a.status = 'Late' OR a.late_minutes > 0 OR a.penalty_status IS NOT NULL)
@@ -309,8 +314,8 @@ export function syncDatabaseOvertimeAndPenalties() {
 
       let penaltyAmt = Number(a.penalty_amount || 0);
       if (penaltyAmt <= 0 && effectiveStatus === "PENALIZED") {
-        const hrRate = a.hourly_rate || 45;
-        penaltyAmt = Math.round((fixedPenalty + ((lateMins / 60) * hrRate * hourlyMult)) * 100) / 100;
+        const hrRate = AttendanceService.getEmployeeEffectiveHourlyRate(a);
+        penaltyAmt = AttendanceService.calculateLatePenaltyAmount(lateMins, hrRate, fixedPenalty, hourlyMult);
       }
 
       // Update attendance if amount or status was missing or stale

@@ -20,14 +20,19 @@ import {
   DollarSign,
   Search,
   Filter,
-  RefreshCw
+  RefreshCw,
+  ChevronRight
 } from "lucide-react";
 
 interface OvertimeManagementTabProps {
   initialSection?: "records" | "penalties" | "rates";
+  onNavigateToSettings?: () => void;
 }
 
-export const OvertimeManagementTab: React.FC<OvertimeManagementTabProps> = ({ initialSection = "records" }) => {
+export const OvertimeManagementTab: React.FC<OvertimeManagementTabProps> = ({ 
+  initialSection = "records",
+  onNavigateToSettings
+}) => {
   const {
     overtimeRecords,
     overtimeStats,
@@ -452,6 +457,27 @@ export const OvertimeManagementTab: React.FC<OvertimeManagementTabProps> = ({ in
       {/* Section 2: Overtime Rate Multipliers Configuration */}
       {activeSection === "rates" && (
         <div className="bg-white rounded-2xl border border-gray-100 p-6 shadow-sm space-y-6 max-w-2xl">
+          {onNavigateToSettings && (
+            <div className="p-4 bg-gradient-to-r from-blue-50 to-indigo-50 rounded-xl border border-blue-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="space-y-1">
+                <span className="text-xs font-bold text-blue-900 flex items-center gap-1.5">
+                  <Clock size={14} className="text-blue-600" />
+                  Centralized Attendance & Work Schedule Settings
+                </span>
+                <p className="text-[11px] text-blue-700 leading-relaxed">
+                  Manage normal check-in/out times, grace periods, earliest/latest cutoff thresholds, and daily/weekly overtime limits in one place.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={onNavigateToSettings}
+                className="px-3.5 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-bold transition shadow-sm shrink-0 flex items-center gap-1.5 self-start sm:self-center"
+              >
+                <span>Full Settings</span>
+                <ChevronRight size={14} />
+              </button>
+            </div>
+          )}
           <div>
             <h3 className="text-base font-bold text-slate-800">Company Overtime Multiplier Policies</h3>
             <p className="text-xs text-gray-500">

@@ -6265,11 +6265,16 @@ MYSQL_DATABASE=your_db_name`}
           {activeTab === "calendar" && (
             <WorkCalendarTab
               readOnly={!user?.role || !["SuperAdmin", "AdminCreator", "AdminManager", "Bootstrap", "HR"].includes(user.role)}
+              onNavigateToSettings={() => setActiveTab("attendance_settings")}
             />
           )}
 
           {/* Module 10: Overtime Management & Automated Test Suite */}
-          {activeTab === "overtime" && <OvertimeManagementTab />}
+          {activeTab === "overtime" && (
+            <OvertimeManagementTab 
+              onNavigateToSettings={() => setActiveTab("attendance_settings")}
+            />
+          )}
 
           {/* Module 11: Late Arrival Penalties Management */}
           {activeTab === "penalties" && (

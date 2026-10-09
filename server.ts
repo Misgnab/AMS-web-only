@@ -754,7 +754,7 @@ app.post("/api/auth/setup-admin", (req: Request, res: Response) => {
     const passwordHash = bcrypt.hashSync(password, 10);
     const result = db.prepare(`
       INSERT INTO users (full_name, phone_number, role, password, hourly_rate, workspace_id)
-      VALUES (?, ?, ?, ?, 45.00, 1)
+      VALUES (?, ?, ?, ?, 150.00, 1)
     `).run(full_name, phone_number, assignedRole, passwordHash);
 
     const userId = Number(result.lastInsertRowid);
@@ -781,7 +781,7 @@ app.post("/api/auth/setup-admin", (req: Request, res: Response) => {
         phone_number,
         role: assignedRole,
         photo: null,
-        hourly_rate: 45.00,
+        hourly_rate: 150.00,
         registration_date: new Date().toISOString(),
         workspace_id: 1,
         workspace_name: ws.name || 'Main Office'
@@ -984,18 +984,20 @@ app.get("/api/employees", authenticateToken, (req: AuthenticatedRequest, res: Re
   }
 
   try {
-    let employees;
+    let rawEmployees: any[];
     if (currentRole === "SuperAdmin") {
-      employees = db.prepare(`
-        SELECT u.id, u.full_name, u.phone_number, u.role, u.photo, u.hourly_rate, u.registration_date, w.name as workspace_name, u.workspace_id,
+      rawEmployees = db.prepare(`
+        SELECT u.id, u.full_name, u.phone_number, u.role, u.photo, u.hourly_rate, u.monthly_base_salary,
+               u.salary_calculation_mode, u.department, u.registration_date, w.name as workspace_name, u.workspace_id,
                u.registered_device_id, u.device_name, u.device_registered_at, u.device_status
         FROM users u
         LEFT JOIN workspaces w ON u.workspace_id = w.id
         ORDER BY u.role DESC, u.full_name ASC
       `).all();
     } else if (currentRole === "Bootstrap") {
-      employees = db.prepare(`
-        SELECT u.id, u.full_name, u.phone_number, u.role, u.photo, u.hourly_rate, u.registration_date, w.name as workspace_name, u.workspace_id,
+      rawEmployees = db.prepare(`
+        SELECT u.id, u.full_name, u.phone_number, u.role, u.photo, u.hourly_rate, u.monthly_base_salary,
+               u.salary_calculation_mode, u.department, u.registration_date, w.name as workspace_name, u.workspace_id,
                u.registered_device_id, u.device_name, u.device_registered_at, u.device_status
         FROM users u
         LEFT JOIN workspaces w ON u.workspace_id = w.id
@@ -1004,8 +1006,9 @@ app.get("/api/employees", authenticateToken, (req: AuthenticatedRequest, res: Re
       `).all();
     } else {
       const { clause, params } = getWorkspaceUsersFilter("u", currentRole, currentWorkspaceId, req.user?.id);
-      employees = db.prepare(`
-        SELECT u.id, u.full_name, u.phone_number, u.role, u.photo, u.hourly_rate, u.registration_date, w.name as workspace_name, u.workspace_id,
+      rawEmployees = db.prepare(`
+        SELECT u.id, u.full_name, u.phone_number, u.role, u.photo, u.hourly_rate, u.monthly_base_salary,
+               u.salary_calculation_mode, u.department, u.registration_date, w.name as workspace_name, u.workspace_id,
                u.registered_device_id, u.device_name, u.device_registered_at, u.device_status, u.created_by
         FROM users u
         LEFT JOIN workspaces w ON u.workspace_id = w.id
@@ -1013,6 +1016,15 @@ app.get("/api/employees", authenticateToken, (req: AuthenticatedRequest, res: Re
         ORDER BY u.role DESC, u.full_name ASC
       `).all(...params);
     }
+
+    const employees = rawEmployees.map((emp) => {
+      const effRate = AttendanceService.getEmployeeEffectiveHourlyRate(emp);
+      return {
+        ...emp,
+        effective_hourly_rate: effRate,
+        hourly_rate: effRate
+      };
+    });
 
     res.json(employees);
   } catch (error) {
@@ -1244,16 +1256,23 @@ app.get("/api/workspaces", authenticateToken, (req: AuthenticatedRequest, res: R
 // Get current profile
 app.get("/api/auth/me", authenticateToken, (req: AuthenticatedRequest, res: Response) => {
   try {
-    const user: any = db.prepare(`
-      SELECT u.id, u.full_name, u.phone_number, u.role, u.photo, u.hourly_rate, u.registration_date, u.workspace_id, w.name as workspace_name,
+    const rawUser: any = db.prepare(`
+      SELECT u.id, u.full_name, u.phone_number, u.role, u.photo, u.hourly_rate, u.monthly_base_salary,
+             u.salary_calculation_mode, u.department, u.registration_date, u.workspace_id, w.name as workspace_name,
              u.registered_device_id, u.device_name, u.device_registered_at, u.device_status
       FROM users u
       LEFT JOIN workspaces w ON u.workspace_id = w.id
       WHERE u.id = ?
     `).get(req.user?.id);
-    if (!user) {
+    if (!rawUser) {
       return res.status(404).json({ error: "User not found" });
     }
+    const effRate = AttendanceService.getEmployeeEffectiveHourlyRate(rawUser);
+    const user = {
+      ...rawUser,
+      effective_hourly_rate: effRate,
+      hourly_rate: effRate
+    };
     res.json(user);
   } catch (error) {
     res.status(500).json({ error: "Internal server error" });
@@ -1712,20 +1731,7 @@ app.put("/api/site-settings", authenticateToken, (req: AuthenticatedRequest, res
   } = req.body;
 
   try {
-    // Validation for conflicting settings
-    if (min_overtime_minutes !== undefined && Number(min_overtime_minutes) < 0) {
-      return res.status(400).json({ error: "Validation Error: Minimum overtime duration cannot be negative." });
-    }
-    if (max_overtime_daily_hours !== undefined && Number(max_overtime_daily_hours) <= 0) {
-      return res.status(400).json({ error: "Validation Error: Maximum daily overtime must be greater than zero." });
-    }
-    if (max_overtime_weekly_hours !== undefined && max_overtime_daily_hours !== undefined && Number(max_overtime_weekly_hours) < Number(max_overtime_daily_hours)) {
-      return res.status(400).json({ error: "Validation Error: Maximum weekly overtime cannot be less than daily overtime." });
-    }
-    if (normal_overtime_multiplier !== undefined && Number(normal_overtime_multiplier) < 1.0) {
-      return res.status(400).json({ error: "Validation Error: Overtime multiplier must be at least 1.0x." });
-    }
-
+    // Fetch existing settings first so partial updates can be validated against current settings
     let existing: any = db.prepare("SELECT * FROM site_settings WHERE workspace_id = ?").get(targetWorkspaceId);
     if (!existing) {
       db.prepare(`
@@ -1747,6 +1753,78 @@ app.put("/api/site-settings", authenticateToken, (req: AuthenticatedRequest, res
       existing = db.prepare("SELECT * FROM site_settings WHERE workspace_id = ?").get(targetWorkspaceId);
     }
 
+    const effWorkStart = work_start_time !== undefined ? work_start_time.trim() : (existing.work_start_time || "08:30");
+    const effWorkEnd = work_end_time !== undefined ? work_end_time.trim() : (existing.work_end_time || "17:30");
+    const effMorningStart = morning_start_time !== undefined ? morning_start_time.trim() : (existing.morning_start_time || "08:30");
+    const effMorningEnd = morning_end_time !== undefined ? morning_end_time.trim() : (existing.morning_end_time || "12:30");
+    const effAfternoonStart = afternoon_start_time !== undefined ? afternoon_start_time.trim() : (existing.afternoon_start_time || "13:30");
+    const effAfternoonEnd = afternoon_end_time !== undefined ? afternoon_end_time.trim() : (existing.afternoon_end_time || "17:30");
+    const effEarliestCheckin = earliest_checkin_time !== undefined ? earliest_checkin_time.trim() : (existing.earliest_checkin_time || "07:00");
+    const effLatestCheckin = latest_checkin_time !== undefined ? latest_checkin_time.trim() : (existing.latest_checkin_time || "10:30");
+    const effEarliestCheckout = earliest_checkout_time !== undefined ? earliest_checkout_time.trim() : (existing.earliest_checkout_time || "16:30");
+    const effLatestCheckout = latest_checkout_time !== undefined ? latest_checkout_time.trim() : (existing.latest_checkout_time || "20:00");
+    const effOtStart = overtime_start_time !== undefined ? overtime_start_time.trim() : (existing.overtime_start_time || "17:30");
+    const effReqDailyHours = required_daily_hours !== undefined ? Number(required_daily_hours) : (existing.required_daily_hours ?? 8.0);
+    const effMaxOtDaily = max_overtime_daily_hours !== undefined ? Number(max_overtime_daily_hours) : (existing.max_overtime_daily_hours ?? 4.0);
+    const effMaxOtWeekly = max_overtime_weekly_hours !== undefined ? Number(max_overtime_weekly_hours) : (existing.max_overtime_weekly_hours ?? 12.0);
+
+    // Validation for conflicting settings
+    const parseTime = (t?: string): number => {
+      if (!t) return 0;
+      const [h, m] = t.split(":").map(Number);
+      return (h || 0) * 60 + (m || 0);
+    };
+
+    if (parseTime(effWorkStart) >= parseTime(effWorkEnd)) {
+      return res.status(400).json({ error: "Validation Error: Normal check-in time must be earlier than normal check-out time." });
+    }
+    if (parseTime(effMorningStart) >= parseTime(effMorningEnd)) {
+      return res.status(400).json({ error: "Validation Error: Morning session start must be earlier than morning session end." });
+    }
+    if (parseTime(effMorningEnd) > parseTime(effAfternoonStart)) {
+      return res.status(400).json({ error: "Validation Error: Morning session end cannot be after Afternoon session start (lunch break overlap)." });
+    }
+    if (parseTime(effAfternoonStart) >= parseTime(effAfternoonEnd)) {
+      return res.status(400).json({ error: "Validation Error: Afternoon session start must be earlier than afternoon session end." });
+    }
+    if (effEarliestCheckin && parseTime(effEarliestCheckin) > parseTime(effWorkStart)) {
+      return res.status(400).json({ error: "Validation Error: Earliest allowed check-in cannot be later than normal check-in time." });
+    }
+    if (effLatestCheckin && parseTime(effLatestCheckin) < parseTime(effWorkStart)) {
+      return res.status(400).json({ error: "Validation Error: Latest allowed check-in cutoff cannot be earlier than normal check-in time." });
+    }
+    if (effEarliestCheckout && parseTime(effEarliestCheckout) > parseTime(effWorkEnd)) {
+      return res.status(400).json({ error: "Validation Error: Earliest allowed check-out cannot be after normal check-out time." });
+    }
+    if (effLatestCheckout && parseTime(effLatestCheckout) < parseTime(effWorkEnd)) {
+      return res.status(400).json({ error: "Validation Error: Latest allowed check-out cutoff cannot be earlier than normal check-out time." });
+    }
+    if (effOtStart && parseTime(effOtStart) < parseTime(effWorkEnd)) {
+      return res.status(400).json({ error: "Validation Error: Overtime start time cannot be earlier than normal check-out time." });
+    }
+    // Ethiopian Labour Proclamation No. 1156/2019 checks
+    if (effReqDailyHours > 10.0 || effReqDailyHours <= 0) {
+      return res.status(400).json({ error: "Validation Error: Under Ethiopian Labour Proclamation No. 1156/2019 Art. 61, regular daily work hours cannot exceed 8 to 10 hours." });
+    }
+    if (effMaxOtDaily > 4.0 || effMaxOtDaily <= 0) {
+      return res.status(400).json({ error: "Validation Error: Under Ethiopian Labour Proclamation No. 1156/2019 Art. 67, daily overtime shall not exceed 4 hours." });
+    }
+    if (effMaxOtWeekly > 12.0 || effMaxOtWeekly < effMaxOtDaily) {
+      return res.status(400).json({ error: "Validation Error: Under Ethiopian Labour Proclamation No. 1156/2019 Art. 67, weekly overtime shall not exceed 12 hours, nor be less than daily overtime." });
+    }
+    if (late_grace_minutes !== undefined && Number(late_grace_minutes) < 0) {
+      return res.status(400).json({ error: "Validation Error: Check-in grace period cannot be negative." });
+    }
+    if (checkout_grace_minutes !== undefined && Number(checkout_grace_minutes) < 0) {
+      return res.status(400).json({ error: "Validation Error: Checkout grace period cannot be negative." });
+    }
+    if (min_overtime_minutes !== undefined && Number(min_overtime_minutes) < 0) {
+      return res.status(400).json({ error: "Validation Error: Minimum overtime duration cannot be negative." });
+    }
+    if (normal_overtime_multiplier !== undefined && Number(normal_overtime_multiplier) < 1.0) {
+      return res.status(400).json({ error: "Validation Error: Overtime multiplier must be at least 1.0x (Labour Proclamation Art. 68 mandates 1.25x for standard overtime)." });
+    }
+
     const cleanOfficeName = office_name !== undefined ? office_name.trim() : (existing.office_name || "Apex Main Office");
     const cleanLat = latitude !== undefined && !isNaN(parseFloat(latitude)) ? parseFloat(latitude) : existing.latitude;
     const cleanLon = longitude !== undefined && !isNaN(parseFloat(longitude)) ? parseFloat(longitude) : existing.longitude;
@@ -1765,13 +1843,13 @@ app.put("/api/site-settings", authenticateToken, (req: AuthenticatedRequest, res
     const cleanNightOt = night_overtime_multiplier !== undefined && !isNaN(parseFloat(night_overtime_multiplier)) ? parseFloat(night_overtime_multiplier) : (existing.night_overtime_multiplier ?? 1.5);
 
     // Regular Work Schedule Values
-    const cleanWorkStart = work_start_time !== undefined ? work_start_time.trim() : (existing.work_start_time || "08:30");
-    const cleanWorkEnd = work_end_time !== undefined ? work_end_time.trim() : (existing.work_end_time || "17:30");
-    const cleanReqDailyHours = required_daily_hours !== undefined && !isNaN(parseFloat(required_daily_hours)) ? parseFloat(required_daily_hours) : (existing.required_daily_hours ?? 8.0);
-    const cleanMorningStart = morning_start_time !== undefined ? morning_start_time.trim() : (existing.morning_start_time || "08:30");
-    const cleanMorningEnd = morning_end_time !== undefined ? morning_end_time.trim() : (existing.morning_end_time || "12:30");
-    const cleanAfternoonStart = afternoon_start_time !== undefined ? afternoon_start_time.trim() : (existing.afternoon_start_time || "13:30");
-    const cleanAfternoonEnd = afternoon_end_time !== undefined ? afternoon_end_time.trim() : (existing.afternoon_end_time || "17:30");
+    const cleanWorkStart = effWorkStart;
+    const cleanWorkEnd = effWorkEnd;
+    const cleanReqDailyHours = effReqDailyHours;
+    const cleanMorningStart = effMorningStart;
+    const cleanMorningEnd = effMorningEnd;
+    const cleanAfternoonStart = effAfternoonStart;
+    const cleanAfternoonEnd = effAfternoonEnd;
 
     // Check-in Rules Values
     const cleanEarliestCheckin = earliest_checkin_time !== undefined ? earliest_checkin_time.trim() : (existing.earliest_checkin_time || "07:00");
@@ -1924,6 +2002,19 @@ app.put("/api/site-settings", authenticateToken, (req: AuthenticatedRequest, res
           item.afternoon_end || cleanAfternoonEnd
         );
       }
+    } else {
+      // Synchronize session times in work_schedules to match newly configured company shift times
+      try {
+        db.prepare(`
+          UPDATE work_schedules
+          SET morning_start = ?,
+              morning_end = ?,
+              afternoon_start = ?,
+              afternoon_end = ?,
+              updated_at = CURRENT_TIMESTAMP
+          WHERE workspace_id = ?
+        `).run(cleanMorningStart, cleanMorningEnd, cleanAfternoonStart, cleanAfternoonEnd, targetWorkspaceId);
+      } catch (_) {}
     }
 
     const updated: any = db.prepare("SELECT * FROM site_settings WHERE workspace_id = ?").get(targetWorkspaceId);
@@ -2062,6 +2153,12 @@ app.get("/api/work-calendar", authenticateToken, (req: AuthenticatedRequest, res
       ORDER BY day_of_week ASC
     `).all(workspaceId) as any[];
 
+    const siteSettings = AttendanceService.getSiteSettings(workspaceId);
+    const defMorningStart = siteSettings.morning_start_time || siteSettings.work_start_time || "08:30";
+    const defMorningEnd = siteSettings.morning_end_time || "12:30";
+    const defAfternoonStart = siteSettings.afternoon_start_time || "13:30";
+    const defAfternoonEnd = siteSettings.afternoon_end_time || siteSettings.work_end_time || "17:30";
+
     if (!schedules || schedules.length === 0) {
       // Auto-populate default 7-day schedule
       const defaultSchedules = [
@@ -2076,17 +2173,17 @@ app.get("/api/work-calendar", authenticateToken, (req: AuthenticatedRequest, res
       for (const s of defaultSchedules) {
         db.prepare(`
           INSERT INTO work_schedules (workspace_id, day_of_week, day_name, morning_status, afternoon_status, morning_start, morning_end, afternoon_start, afternoon_end)
-          VALUES (?, ?, ?, ?, ?, '08:30', '12:30', '13:30', '17:30')
-        `).run(workspaceId, s.day, s.name, s.morning, s.afternoon);
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(workspaceId, s.day, s.name, s.morning, s.afternoon, defMorningStart, defMorningEnd, defAfternoonStart, defAfternoonEnd);
       }
       schedules = db.prepare("SELECT * FROM work_schedules WHERE workspace_id = ? ORDER BY day_of_week ASC").all(workspaceId) as any[];
     }
 
     const enrichedSchedules = schedules.map((s) => {
-      const mStartEth = formatToEthiopianTime(s.morning_start || "08:30");
-      const mEndEth = formatToEthiopianTime(s.morning_end || "12:30");
-      const aStartEth = formatToEthiopianTime(s.afternoon_start || "13:30");
-      const aEndEth = formatToEthiopianTime(s.afternoon_end || "17:30");
+      const mStartEth = formatToEthiopianTime(s.morning_start || defMorningStart);
+      const mEndEth = formatToEthiopianTime(s.morning_end || defMorningEnd);
+      const aStartEth = formatToEthiopianTime(s.afternoon_start || defAfternoonStart);
+      const aEndEth = formatToEthiopianTime(s.afternoon_end || defAfternoonEnd);
       return {
         ...s,
         morning_start_ethiopian: mStartEth.shortText,
@@ -2120,6 +2217,12 @@ app.put("/api/work-calendar", authenticateToken, (req: AuthenticatedRequest, res
   }
 
   try {
+    const siteSettings = AttendanceService.getSiteSettings(workspaceId);
+    const defMorningStart = siteSettings.morning_start_time || siteSettings.work_start_time || "08:30";
+    const defMorningEnd = siteSettings.morning_end_time || "12:30";
+    const defAfternoonStart = siteSettings.afternoon_start_time || "13:30";
+    const defAfternoonEnd = siteSettings.afternoon_end_time || siteSettings.work_end_time || "17:30";
+
     const updateStmt = db.prepare(`
       INSERT INTO work_schedules (
         workspace_id, day_of_week, day_name, morning_status, afternoon_status, 
@@ -2142,20 +2245,20 @@ app.put("/api/work-calendar", authenticateToken, (req: AuthenticatedRequest, res
       const dayName = item.day_name || dayNames[dayNum] || `Day ${dayNum}`;
       const mStatus = item.morning_status === "NON_WORKING" ? "NON_WORKING" : "WORKING";
       const aStatus = item.afternoon_status === "NON_WORKING" ? "NON_WORKING" : "WORKING";
-      const mStart = item.morning_start || "08:30";
-      const mEnd = item.morning_end || "12:30";
-      const aStart = item.afternoon_start || "13:30";
-      const aEnd = item.afternoon_end || "17:30";
+      const mStart = item.morning_start || defMorningStart;
+      const mEnd = item.morning_end || defMorningEnd;
+      const aStart = item.afternoon_start || defAfternoonStart;
+      const aEnd = item.afternoon_end || defAfternoonEnd;
 
       updateStmt.run(workspaceId, dayNum, dayName, mStatus, aStatus, mStart, mEnd, aStart, aEnd);
     }
 
     const updated = db.prepare("SELECT * FROM work_schedules WHERE workspace_id = ? ORDER BY day_of_week ASC").all(workspaceId) as any[];
     const enrichedUpdated = updated.map((s) => {
-      const mStartEth = formatToEthiopianTime(s.morning_start || "08:30");
-      const mEndEth = formatToEthiopianTime(s.morning_end || "12:30");
-      const aStartEth = formatToEthiopianTime(s.afternoon_start || "13:30");
-      const aEndEth = formatToEthiopianTime(s.afternoon_end || "17:30");
+      const mStartEth = formatToEthiopianTime(s.morning_start || defMorningStart);
+      const mEndEth = formatToEthiopianTime(s.morning_end || defMorningEnd);
+      const aStartEth = formatToEthiopianTime(s.afternoon_start || defAfternoonStart);
+      const aEndEth = formatToEthiopianTime(s.afternoon_end || defAfternoonEnd);
       return {
         ...s,
         morning_start_ethiopian: mStartEth.shortText,
@@ -2741,6 +2844,12 @@ app.post("/api/overtime/manual", authenticateToken, (req: AuthenticatedRequest, 
 
     const otStatus = status.toUpperCase() === "PENDING" ? "PENDING" : "APPROVED";
 
+    const siteSettings = AttendanceService.getSiteSettings(workspaceId);
+    const otStartStr = siteSettings.overtime_start_time || siteSettings.work_end_time || "17:30";
+    const otStartEth = formatToEthiopianTime(otStartStr);
+    const defaultOtIn = `${String(otStartEth.ethHour).padStart(2, "0")}:${otStartEth.minute}:00`;
+    const defaultOtOut = `${String((otStartEth.ethHour + 3) % 12 || 12).padStart(2, "0")}:${otStartEth.minute}:00`;
+
     const otRes = db.prepare(`
       INSERT INTO overtime_records (
         employee_id, workspace_id, date, check_in_time, check_out_time,
@@ -2752,8 +2861,8 @@ app.post("/api/overtime/manual", authenticateToken, (req: AuthenticatedRequest, 
       employee_id,
       workspaceId,
       date,
-      check_in_time || "17:30:00",
-      check_out_time || "20:30:00",
+      check_in_time || defaultOtIn,
+      check_out_time || defaultOtOut,
       defaultType,
       reason || "MANUAL_ENTRY",
       numHours,
@@ -2880,7 +2989,7 @@ app.get("/api/penalties", authenticateToken, (req: AuthenticatedRequest, res: Re
 
     // First: Ensure any unpersisted late attendance rows are synced into late_penalties table
     const unpersistedRows: any[] = db.prepare(`
-      SELECT a.*, u.hourly_rate
+      SELECT a.*, u.hourly_rate, u.monthly_base_salary
       FROM attendance a
       JOIN users u ON a.user_id = u.id
       WHERE a.workspace_id = ?
@@ -2890,7 +2999,11 @@ app.get("/api/penalties", authenticateToken, (req: AuthenticatedRequest, res: Re
 
     for (const a of unpersistedRows) {
       let lateMins = a.late_minutes || 0;
-      const scheduledStart = a.session === "Morning" ? "02:00:00" : "07:00:00";
+      const scheduledStartStr = a.session === "Morning" 
+        ? (siteSettings.morning_start_time || siteSettings.work_start_time) 
+        : siteSettings.afternoon_start_time;
+      const scheduledStartEth = formatToEthiopianTime(scheduledStartStr);
+      const scheduledStart = `${String(scheduledStartEth.ethHour).padStart(2, "0")}:${scheduledStartEth.minute}:00`;
       if (!lateMins && a.check_in_time) {
         let [chH, chM] = a.check_in_time.split(":").map(Number);
         const [stH, stM] = scheduledStart.split(":").map(Number);
@@ -2915,8 +3028,8 @@ app.get("/api/penalties", authenticateToken, (req: AuthenticatedRequest, res: Re
 
       let penAmt = Number(a.penalty_amount || 0);
       if (penAmt <= 0 && effStatus === "PENALIZED") {
-        const hrRate = a.hourly_rate || 45;
-        penAmt = Math.round((fixedPenalty + ((lateMins / 60) * hrRate * hourlyMultiplier)) * 100) / 100;
+        const hrRate = AttendanceService.getEmployeeEffectiveHourlyRate(a);
+        penAmt = AttendanceService.calculateLatePenaltyAmount(lateMins, hrRate, fixedPenalty, hourlyMultiplier);
       }
 
       db.prepare(`
@@ -2966,6 +3079,7 @@ app.get("/api/penalties", authenticateToken, (req: AuthenticatedRequest, res: Re
         u.role as employee_role,
         u.phone_number,
         u.hourly_rate,
+        u.monthly_base_salary,
         u.photo,
         waiver.full_name as waived_by_name,
         proc.full_name as processed_by_name,
@@ -2995,10 +3109,10 @@ app.get("/api/penalties", authenticateToken, (req: AuthenticatedRequest, res: Re
     const allRecords = rawRecords.map((r) => {
       let penaltyAmt = Number(r.penalty_amount || 0);
       let effStatus = r.penalty_status || (r.late_minutes > graceMins ? "PENALIZED" : "WITHIN_GRACE");
+      const empRate = AttendanceService.getEmployeeEffectiveHourlyRate(r);
 
       if (penaltyAmt <= 0 && (effStatus === "PENALIZED" || effStatus === "PAID")) {
-        const empRate = r.hourly_rate || 45;
-        penaltyAmt = Math.round((fixedPenalty + ((r.late_minutes / 60) * empRate * hourlyMultiplier)) * 100) / 100;
+        penaltyAmt = AttendanceService.calculateLatePenaltyAmount(r.late_minutes, empRate, fixedPenalty, hourlyMultiplier);
         // Update database row with calculated penalty
         db.prepare("UPDATE late_penalties SET penalty_amount = ?, penalty_status = ? WHERE id = ?").run(penaltyAmt, effStatus, r.id);
         if (r.attendance_id) {
@@ -3022,7 +3136,9 @@ app.get("/api/penalties", authenticateToken, (req: AuthenticatedRequest, res: Re
         employee_name: r.employee_name,
         employee_role: r.employee_role,
         phone_number: r.phone_number,
-        hourly_rate: r.hourly_rate || 45,
+        hourly_rate: empRate,
+        monthly_base_salary: r.monthly_base_salary || 0,
+        effective_hourly_rate: empRate,
         photo: r.photo,
         date: r.date,
         session: r.session,
@@ -3389,9 +3505,22 @@ app.post("/api/penalties/manual", authenticateToken, (req: AuthenticatedRequest,
 
   try {
     const lateMins = parseInt(late_minutes || "15", 10);
-    const penaltyAmt = parseFloat(penalty_amount || "25");
-    let checkIn = check_in_time || (session === "Morning" ? "02:30:00" : "07:30:00");
-    const scheduledStart = session === "Morning" ? "02:00:00" : "07:00:00";
+    const siteSettings = AttendanceService.getSiteSettings(workspaceId);
+    const empUser: any = db.prepare("SELECT hourly_rate, monthly_base_salary FROM users WHERE id = ?").get(targetUserId);
+    const empHourlyRate = AttendanceService.getEmployeeEffectiveHourlyRate(empUser);
+    const fixedPenalty = siteSettings.late_penalty_fixed_amount ?? 25.0;
+    const hourlyMultiplier = siteSettings.late_penalty_hourly_multiplier ?? 0.5;
+
+    let penaltyAmt = parseFloat(penalty_amount);
+    if (isNaN(penaltyAmt) || penaltyAmt <= 0) {
+      penaltyAmt = AttendanceService.calculateLatePenaltyAmount(lateMins, empHourlyRate, fixedPenalty, hourlyMultiplier);
+    }
+    const scheduledStartStr = session === "Morning" 
+      ? (siteSettings.morning_start_time || siteSettings.work_start_time) 
+      : siteSettings.afternoon_start_time;
+    const scheduledStartEth = formatToEthiopianTime(scheduledStartStr);
+    const scheduledStart = `${String(scheduledStartEth.ethHour).padStart(2, "0")}:${scheduledStartEth.minute}:00`;
+    let checkIn = check_in_time || scheduledStart;
     const normalizedDate = getEthiopianDateString(date);
 
     // Normalize checkIn time to Ethiopian clock if entered in 24-hr Gregorian format:
@@ -3707,9 +3836,6 @@ app.post("/api/attendance/check-in", authenticateToken, (req: AuthenticatedReque
   const todayStr = getEthiopianDateString();
   const nowTimeStr = getEthiopianTimeString();
   const [nowH, nowM] = nowTimeStr.split(":").map(Number);
-  const nowTotalMins = (nowH || 0) * 60 + (nowM || 0);
-  const activeSession = (nowTotalMins < 390 || nowTimeStr < "06:30:00") ? "Morning" : "Afternoon";
-
   const complianceRoles = ["Employee", "Purchaser", "Accountant", "Engineer", "HR", "AdminCreator", "AdminManager"];
 
   try {
@@ -3727,9 +3853,26 @@ app.post("/api/attendance/check-in", authenticateToken, (req: AuthenticatedReque
       }
     }
 
+    const siteSettings = AttendanceService.getSiteSettings(workspaceId);
+
+    const settingTimeToEthMins = (timeStr?: string, defaultMins: number = 0): number => {
+      if (!timeStr) return defaultMins;
+      const parts = timeStr.trim().split(":");
+      const h = parseInt(parts[0], 10);
+      const m = parseInt(parts[1] || "0", 10);
+      if (isNaN(h)) return defaultMins;
+      const ethH = (h >= 6 && h <= 23) ? ((h - 6 + 24) % 24) : h;
+      return ethH * 60 + m;
+    };
+
+    const nowTotalMins = (nowH || 0) * 60 + (nowM || 0);
+    const afternoonStartEthMins = settingTimeToEthMins(siteSettings.afternoon_start_time, 450);
+    const activeSession = nowTotalMins < afternoonStartEthMins ? "Morning" : "Afternoon";
+
     // STEP 0: DEVICE BINDING & ANTI-BUDDY PUNCHING VALIDATION
     const currentUser: any = db.prepare(`
-      SELECT id, full_name, phone_number, registered_device_id, device_name, device_status 
+      SELECT id, full_name, phone_number, role, hourly_rate, monthly_base_salary,
+             registered_device_id, device_name, device_status 
       FROM users 
       WHERE id = ?
     `).get(req.user?.id);
@@ -4049,12 +4192,9 @@ app.post("/api/attendance/check-in", authenticateToken, (req: AuthenticatedReque
     calculatedDistance = gpsEval.distance;
     gpsAccuracy = gpsEval.accuracy;
 
-    const siteSettings = AttendanceService.getSiteSettings(workspaceId);
-
     // 1. Enforce Earliest Allowed Check-in Time
     if (siteSettings.earliest_checkin_time && activeSession === "Morning") {
-      const [eh, em] = siteSettings.earliest_checkin_time.split(":").map(Number);
-      const earliestEthMins = (eh >= 7) ? ((eh - 6 + 24) % 24) * 60 + (em || 0) : eh * 60 + (em || 0);
+      const earliestEthMins = settingTimeToEthMins(siteSettings.earliest_checkin_time);
       if (nowTotalMins < earliestEthMins) {
         return res.status(400).json({
           error: `Check-in restriction: Early check-in is not permitted before ${siteSettings.earliest_checkin_time}. Company policy restricts check-in prior to this window.`,
@@ -4064,13 +4204,23 @@ app.post("/api/attendance/check-in", authenticateToken, (req: AuthenticatedReque
       }
     }
 
-    // 2. Scheduled session start & lateness evaluation
-    const scheduledStartStr = activeSession === "Morning" ? siteSettings.morning_start_time : siteSettings.afternoon_start_time;
-    let scheduledStartEthMins = activeSession === "Morning" ? 150 : 450;
-    if (scheduledStartStr) {
-      const [sh, sm] = scheduledStartStr.split(":").map(Number);
-      scheduledStartEthMins = (sh >= 7) ? ((sh - 6 + 24) % 24) * 60 + (sm || 0) : sh * 60 + (sm || 0);
+    // 2. Enforce Latest Allowed Check-in Cutoff
+    if (siteSettings.latest_checkin_time && activeSession === "Morning") {
+      const latestEthMins = settingTimeToEthMins(siteSettings.latest_checkin_time);
+      if (nowTotalMins > latestEthMins) {
+        return res.status(400).json({
+          error: `Check-in restriction: Check-in window closed at ${siteSettings.latest_checkin_time}. Company policy restricts check-ins after this cutoff time.`,
+          code: "LATEST_CHECKIN_RESTRICTION",
+          latest_allowed: siteSettings.latest_checkin_time
+        });
+      }
     }
+
+    // 3. Scheduled session start & lateness evaluation
+    const scheduledStartStr = activeSession === "Morning" 
+      ? (siteSettings.morning_start_time || siteSettings.work_start_time) 
+      : siteSettings.afternoon_start_time;
+    const scheduledStartEthMins = settingTimeToEthMins(scheduledStartStr);
 
     const lateness = AttendanceService.evaluateLateness(
       activeSession, 
@@ -4085,10 +4235,10 @@ app.post("/api/attendance/check-in", authenticateToken, (req: AuthenticatedReque
     let penaltyAmount = 0.0;
     if (lateness.isLate) {
       penaltyStatus = "PENALIZED";
-      const userHourlyRate = currentUser?.hourly_rate || 45;
+      const userHourlyRate = AttendanceService.getEmployeeEffectiveHourlyRate(currentUser);
       const fixedPenalty = siteSettings.late_penalty_fixed_amount ?? 25.0;
       const hourlyMultiplier = siteSettings.late_penalty_hourly_multiplier ?? 0.5;
-      penaltyAmount = Math.round((fixedPenalty + ((lateMinutes / 60) * userHourlyRate * hourlyMultiplier)) * 100) / 100;
+      penaltyAmount = AttendanceService.calculateLatePenaltyAmount(lateMinutes, userHourlyRate, fixedPenalty, hourlyMultiplier);
     } else if (lateness.isWithinGracePeriod) {
       penaltyStatus = "WITHIN_GRACE";
     }
@@ -4140,7 +4290,8 @@ app.post("/api/attendance/check-in", authenticateToken, (req: AuthenticatedReque
 
     // Persist to late_penalties table in database if late or penalized or within grace
     if (penaltyStatus === "PENALIZED" || penaltyStatus === "WITHIN_GRACE" || lateMinutes > 0) {
-      const scheduledStart = activeSession === "Morning" ? "02:00:00" : "07:00:00";
+      const scheduledStartEth = formatToEthiopianTime(scheduledStartStr);
+      const scheduledStart = `${String(scheduledStartEth.ethHour).padStart(2, "0")}:${scheduledStartEth.minute}:00`;
       try {
         db.prepare(`
           INSERT INTO late_penalties (
@@ -4211,6 +4362,8 @@ app.post("/api/attendance/check-out", authenticateToken, (req: AuthenticatedRequ
 
   const todayStr = getEthiopianDateString();
   const nowTimeStr = getEthiopianTimeString();
+  const [nowH, nowM] = nowTimeStr.split(":").map(Number);
+  const nowTotalMins = (nowH || 0) * 60 + (nowM || 0);
   const complianceRoles = ["Employee", "Purchaser", "Accountant", "Engineer", "HR", "AdminCreator", "AdminManager"];
 
   try {
@@ -4290,12 +4443,40 @@ app.post("/api/attendance/check-out", authenticateToken, (req: AuthenticatedRequ
       return res.status(400).json({ error: `You have already checked out of the ${record.session} session today` });
     }
 
-    // STRICT SESSION CHECKOUT RULES:
-    const [nowH, nowM] = nowTimeStr.split(":").map(Number);
-    const nowTotalMins = (nowH || 0) * 60 + (nowM || 0);
+    const siteSettings = AttendanceService.getSiteSettings(workspaceId);
 
-    // If attempting to check out of Morning session during Afternoon (past 06:30 Ethiopian / 12:30 Gregorian)
-    if (record.session === "Morning" && (nowTotalMins >= 390 || nowTimeStr >= "06:30:00")) {
+    const settingTimeToEthMins = (timeStr?: string, defaultMins: number = 0): number => {
+      if (!timeStr) return defaultMins;
+      const parts = timeStr.trim().split(":");
+      const h = parseInt(parts[0], 10);
+      const m = parseInt(parts[1] || "0", 10);
+      if (isNaN(h)) return defaultMins;
+      const ethH = (h >= 6 && h <= 23) ? ((h - 6 + 24) % 24) : h;
+      return ethH * 60 + m;
+    };
+
+    const morningEndEthMins = settingTimeToEthMins(siteSettings.morning_end_time, 390);
+    const morningCheckoutCutoff = morningEndEthMins + (siteSettings.checkout_grace_minutes || 0);
+
+    const afternoonEndEthMins = settingTimeToEthMins(siteSettings.afternoon_end_time || siteSettings.work_end_time, 690);
+    const afternoonCheckoutCutoff = siteSettings.latest_checkout_time 
+      ? settingTimeToEthMins(siteSettings.latest_checkout_time, 720) 
+      : afternoonEndEthMins + (siteSettings.checkout_grace_minutes || 0);
+
+    // Enforce earliest allowed checkout if configured:
+    if (siteSettings.earliest_checkout_time && record.session === "Afternoon") {
+      const earliestCheckoutEthMins = settingTimeToEthMins(siteSettings.earliest_checkout_time);
+      if (nowTotalMins < earliestCheckoutEthMins) {
+        return res.status(400).json({
+          error: `Checkout restriction: Early checkout is not permitted before ${siteSettings.earliest_checkout_time}. Company policy restricts checkout prior to this window.`,
+          code: "EARLIEST_CHECKOUT_RESTRICTION",
+          earliest_allowed: siteSettings.earliest_checkout_time
+        });
+      }
+    }
+
+    // STRICT SESSION CHECKOUT RULES (DYNAMICALLY CONFIGURED):
+    if (record.session === "Morning" && nowTotalMins > morningCheckoutCutoff) {
       db.prepare(`
         UPDATE attendance 
         SET status = 'Missing Checkout', 
@@ -4307,13 +4488,12 @@ app.post("/api/attendance/check-out", authenticateToken, (req: AuthenticatedRequ
       broadcastServerEvent("ATTENDANCE_CHANGED", { userId: req.user?.id, action: "missing_checkout_flagged" }, workspaceId);
 
       return res.status(400).json({
-        error: `Morning session ended at 06:30. You did not record a check-out during the Morning session window. Your attendance has been flagged as "Missing Checkout". Please submit a Departure Correction request for Administrator review.`,
+        error: `Morning session ended at ${siteSettings.morning_end_time || '12:30'}. You did not record a check-out during the permitted window. Your attendance has been flagged as "Missing Checkout". Please submit a Departure Correction request for Administrator review.`,
         code: "SESSION_CONCLUDED_MISSING_CHECKOUT"
       });
     }
 
-    // If attempting to check out of Afternoon session after afternoon window (past 12:00 Ethiopian / 18:00 Gregorian)
-    if (record.session === "Afternoon" && (nowTotalMins >= 720 || nowTimeStr >= "12:00:00")) {
+    if (record.session === "Afternoon" && nowTotalMins > afternoonCheckoutCutoff) {
       db.prepare(`
         UPDATE attendance 
         SET status = 'Missing Checkout', 
@@ -4325,7 +4505,7 @@ app.post("/api/attendance/check-out", authenticateToken, (req: AuthenticatedRequ
       broadcastServerEvent("ATTENDANCE_CHANGED", { userId: req.user?.id, action: "missing_checkout_flagged" }, workspaceId);
 
       return res.status(400).json({
-        error: `Afternoon session ended at 12:00 (06:00 PM). You did not record a check-out during the Afternoon session window. Your attendance has been flagged as "Missing Checkout". Please submit a Departure Correction request for Administrator review.`,
+        error: `Afternoon departure window concluded at ${siteSettings.latest_checkout_time || siteSettings.afternoon_end_time || '17:30'}. You did not record a check-out during the permitted window. Your attendance has been flagged as "Missing Checkout". Please submit a Departure Correction request for Administrator review.`,
         code: "SESSION_CONCLUDED_MISSING_CHECKOUT"
       });
     }
@@ -4396,8 +4576,6 @@ app.post("/api/attendance/check-out", authenticateToken, (req: AuthenticatedRequ
     calculatedDistance = gpsEval.distance;
     gpsAccuracy = gpsEval.accuracy;
 
-    const siteSettings = AttendanceService.getSiteSettings(workspaceId);
-
     // Check if there is an approved early overtime authorization for today
     let hasApprovedEarlyWork = false;
     try {
@@ -4408,7 +4586,13 @@ app.post("/api/attendance/check-out", authenticateToken, (req: AuthenticatedRequ
       hasApprovedEarlyWork = !!approvedEarlyOt;
     } catch (_) {}
 
-    const checkInTime = record.check_in_time || (record.session === "Morning" ? "02:00:00" : "07:00:00");
+    const sessionStartStr = record.session === "Morning" 
+      ? (siteSettings.morning_start_time || siteSettings.work_start_time) 
+      : siteSettings.afternoon_start_time;
+    const sessionStartEth = formatToEthiopianTime(sessionStartStr);
+    const defaultCheckInTime = `${String(sessionStartEth.ethHour).padStart(2, "0")}:${sessionStartEth.minute}:00`;
+    const checkInTime = record.check_in_time || defaultCheckInTime;
+
     const breakdown = WorkCalendarService.computeAttendanceHoursBreakdown(
       workspaceId,
       todayStr,
@@ -4422,12 +4606,21 @@ app.post("/api/attendance/check-out", authenticateToken, (req: AuthenticatedRequ
     const requireApproval = (siteSettings.require_overtime_approval ?? 1) === 1;
     const overtimeStatus = hasOvertime ? (requireApproval ? "PENDING" : "APPROVED") : null;
 
+    const sessionStartMins = settingTimeToEthMins(sessionStartStr);
+    const isLateCheckin = AttendanceService.evaluateLateness(
+      record.session, 
+      checkInTime, 
+      siteSettings.late_grace_minutes, 
+      sessionStartMins
+    ).isLate;
+    const resolvedMissingStatus = isLateCheckin ? 'Late' : 'Present';
+
     db.prepare(`
       UPDATE attendance 
       SET check_out_time = ?, 
           original_check_out = COALESCE(original_check_out, ?),
           worked_minutes = ?,
-          status = CASE WHEN status = 'Missing Checkout' THEN (CASE WHEN check_in_time > '02:15:00' THEN 'Late' ELSE 'Present' END) ELSE status END,
+          status = CASE WHEN status = 'Missing Checkout' THEN '${resolvedMissingStatus}' ELSE status END,
           total_hours = ?, 
           regular_hours = ?,
           overtime_hours = ?,
@@ -4778,13 +4971,20 @@ const handleCorrectCheckout = (req: AuthenticatedRequest, res: Response) => {
       return res.status(403).json({ error: "Access denied: Record belongs to a different workspace." });
     }
 
-    const employee: any = db.prepare("SELECT id, full_name, phone_number, role, workspace_id FROM users WHERE id = ?").get(record.user_id);
+    const employee: any = db.prepare("SELECT id, full_name, phone_number, role, workspace_id, hourly_rate, monthly_base_salary FROM users WHERE id = ?").get(record.user_id);
 
     // Format times
     let formattedOutTime = check_out_time.trim();
     if (formattedOutTime.length === 5) formattedOutTime += ":00";
 
-    let formattedInTime = (check_in_time ? check_in_time.trim() : record.check_in_time) || (record.session === "Morning" ? "02:00:00" : "07:00:00");
+    const ssForCorrection = AttendanceService.getSiteSettings(record.workspace_id || req.user?.workspace_id || 1);
+    const defSessionStart = record.session === "Morning"
+      ? (ssForCorrection.morning_start_time || ssForCorrection.work_start_time || "08:30")
+      : (ssForCorrection.afternoon_start_time || "13:30");
+    const defStartEth = formatToEthiopianTime(defSessionStart);
+    const defFormattedIn = `${String(defStartEth.ethHour).padStart(2, "0")}:${defStartEth.minute}:00`;
+
+    let formattedInTime = (check_in_time ? check_in_time.trim() : record.check_in_time) || defFormattedIn;
     if (formattedInTime.length === 5) formattedInTime += ":00";
 
     // Session-aware time format normalization (prevents 10-hour discrepancy between Ethiopian and Gregorian clock inputs)
@@ -6338,6 +6538,19 @@ function calculateEnterprisePayrollForUser(
   const requireOtApproval = (siteSettings.require_overtime_approval ?? 1) === 1;
   const otEnabled = (siteSettings.overtime_enabled ?? 1) === 1;
   const maxWeeklyOt = Number(siteSettings.max_overtime_weekly_hours ?? 12.0);
+  const weeklyOtMap = new Map<string, number>();
+  const getWeekKey = (dateStr: string): string => {
+    try {
+      const p = dateStr.split("-").map(Number);
+      const dObj = new Date(p[0], (p[1] || 1) - 1, p[2] || 1);
+      const day = dObj.getDay();
+      const diff = dObj.getDate() - day + (day === 0 ? -6 : 1);
+      const mon = new Date(dObj.setDate(diff));
+      return `${mon.getFullYear()}-${String(mon.getMonth() + 1).padStart(2, "0")}-${String(mon.getDate()).padStart(2, "0")}`;
+    } catch (_) {
+      return dateStr;
+    }
+  };
 
   // Query approved overtime records from overtime_records table
   const approvedOvertimeRecords = db.prepare(`
@@ -6397,8 +6610,12 @@ function calculateEnterprisePayrollForUser(
             const isPayableOt = otEnabled && (requireOtApproval ? isOtApproved : (a.overtime_status !== "REJECTED" && (!matchedOtRecord || matchedOtRecord.status !== "REJECTED")));
 
             if (isPayableOt) {
-
-              const effectiveOtHours = matchedOtRecord ? Number(matchedOtRecord.hours) : otHours;
+              const rawOtHours = matchedOtRecord ? Number(matchedOtRecord.hours) : otHours;
+              const wKey = getWeekKey(d);
+              const curWeeklyOt = weeklyOtMap.get(wKey) || 0;
+              const remainingWeeklyAllowance = Math.max(0, maxWeeklyOt - curWeeklyOt);
+              const effectiveOtHours = Math.min(rawOtHours, remainingWeeklyAllowance);
+              weeklyOtMap.set(wKey, curWeeklyOt + effectiveOtHours);
 
               if (effectiveOtHours > 0) {
                 overtimeHours += effectiveOtHours;
@@ -6449,15 +6666,23 @@ function calculateEnterprisePayrollForUser(
 
             const isWaived = a.penalty_status === "WAIVED";
             let isLate = (a.status === "Late" || a.penalty_status === "PENALIZED") && !isWaived;
-            let lMins = 0;
-            if (a.check_in_time && !isWaived) {
+            let lMins = a.late_minutes || 0;
+            if (a.check_in_time && !isWaived && lMins === 0) {
+              const startStr = session === "Morning" 
+                ? (siteSettings.morning_start_time || siteSettings.work_start_time || "08:30") 
+                : (siteSettings.afternoon_start_time || "13:30");
+              const [stH, stM] = startStr.split(":").map(Number);
               const [h, m] = a.check_in_time.split(":").map(Number);
-              if (session === "Morning" && (h > 8 || (h === 8 && m > 30))) {
+              let checkH = h;
+              if (checkH >= 1 && checkH <= 12 && stH >= 6) {
+                checkH = (checkH + 6) % 24;
+              }
+              const schedMins = (stH || 8) * 60 + (stM || 30);
+              const chkMins = (checkH || 8) * 60 + (m || 30);
+              const graceCutoff = schedMins + (siteSettings.late_grace_minutes ?? 15);
+              if (chkMins > graceCutoff) {
                 isLate = true;
-                lMins = Math.max(0, (h - 8) * 60 + (m - 30));
-              } else if (session === "Afternoon" && (h > 13 || (h === 13 && m > 30))) {
-                isLate = true;
-                lMins = Math.max(0, (h - 13) * 60 + (m - 30));
+                lMins = Math.max(0, chkMins - schedMins);
               }
             }
             if (isLate) {
@@ -6474,13 +6699,20 @@ function calculateEnterprisePayrollForUser(
               displayStatus = "Working Overtime";
             }
 
+            const defaultInTime = session === "Morning" 
+              ? (siteSettings.morning_start_time || siteSettings.work_start_time) 
+              : siteSettings.afternoon_start_time;
+            const defaultOutTime = session === "Morning" 
+              ? siteSettings.morning_end_time 
+              : (siteSettings.afternoon_end_time || siteSettings.work_end_time);
+
             dayLogs.push({
               date: d,
               dayOfWeek: getDayOfWeekName(d),
               session,
               status: displayStatus,
-              checkInTime: a.check_in_time || (session === "Morning" ? "08:30" : "13:30"),
-              checkOutTime: a.check_out_time || (session === "Morning" ? "12:30" : "17:30"),
+              checkInTime: a.check_in_time || defaultInTime,
+              checkOutTime: a.check_out_time || defaultOutTime,
               regularHours: rHours,
               overtimeHours: otHours,
               overtimeMultiplier: appliedOtMultiplier,
@@ -6621,7 +6853,13 @@ function calculateEnterprisePayrollForUser(
   // Incorporate any standalone approved overtime records (e.g. weekend shifts, night shifts, or manual admin entries)
   approvedOvertimeRecords.forEach(ot => {
     if (!processedOtRecordIds.has(ot.id)) {
-      const otHours = Number(ot.hours || 0);
+      const rawOtHours = Number(ot.hours || 0);
+      const wKey = getWeekKey(ot.date);
+      const curWeeklyOt = weeklyOtMap.get(wKey) || 0;
+      const remainingWeeklyAllowance = Math.max(0, maxWeeklyOt - curWeeklyOt);
+      const otHours = Math.min(rawOtHours, remainingWeeklyAllowance);
+      weeklyOtMap.set(wKey, curWeeklyOt + otHours);
+
       if (otHours > 0) {
         overtimeHours += otHours;
         const otType = ot.overtime_type || "REGULAR_OVERTIME";
@@ -6726,9 +6964,11 @@ function calculateEnterprisePayrollForUser(
     ? Math.round(monthlyBaseSalary * periodRatio * 100) / 100
     : Math.round((regularPay + paidLeaveAmount) * 100) / 100;
 
+  const lateFixedFine = siteSettings.late_penalty_fixed_amount ?? 25.0;
+  const lateHourlyMultiplier = siteSettings.late_penalty_hourly_multiplier ?? 0.5;
   const lateDeduction = Math.round(Math.min(
     regularPay * 0.25,
-    (lateCount * 25) + ((lateMinutes / 60) * effectiveHourlyRate * 0.5)
+    (lateCount * lateFixedFine) + ((lateMinutes / 60) * effectiveHourlyRate * lateHourlyMultiplier)
   ) * 100) / 100;
 
   let absentDeduction = 0;
