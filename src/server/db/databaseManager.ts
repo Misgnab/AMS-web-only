@@ -89,6 +89,10 @@ export class DatabaseManager implements IDatabaseDriver {
 
   private startReconnectLoop(): void {
     if (this.reconnectTimer) return;
+    // Do not continuously poll local 127.0.0.1/localhost if no local MySQL daemon is running
+    if (["127.0.0.1", "localhost"].includes(this.config.mysql.host)) {
+      return;
+    }
     this.reconnectTimer = setInterval(() => {
       if (this.mysqlDriver.isReady() && this.effectiveEngine === "mysql") {
         if (this.reconnectTimer) {
@@ -154,8 +158,8 @@ export class DatabaseManager implements IDatabaseDriver {
     const database = process.env.MYSQL_DATABASE || savedConfig?.mysql?.database || "buildtrack_ams";
     const ssl = process.env.MYSQL_SSL === "true" || !!savedConfig?.mysql?.ssl;
 
-    const requestedEngine = (process.env.DB_TYPE || savedConfig?.activeEngine || "mysql").toLowerCase();
-    const activeEngine: DatabaseEngine = requestedEngine === "sqlite" ? "sqlite" : "mysql";
+    const requestedEngine = (savedConfig?.activeEngine || process.env.DB_TYPE || "sqlite").toLowerCase();
+    const activeEngine: DatabaseEngine = requestedEngine === "mysql" ? "mysql" : "sqlite";
 
     return {
       activeEngine,
