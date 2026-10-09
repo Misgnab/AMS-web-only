@@ -1,4 +1,4 @@
-export type DatabaseEngine = "mysql" | "sqlite";
+export type DatabaseEngine = "mysql";
 
 export interface PreparedStatement {
   get(...params: any[]): any;
@@ -31,7 +31,6 @@ export interface MysqlConfig {
 export interface DatabaseConfiguration {
   activeEngine: DatabaseEngine;
   mysql: MysqlConfig;
-  sqlitePath?: string;
 }
 
 export interface TableCount {
@@ -61,7 +60,6 @@ export interface DualDatabaseStatus {
   effectiveEngine: DatabaseEngine;
   isFallback: boolean;
   mysql: DatabaseStatusDetails;
-  sqlite?: DatabaseStatusDetails;
   tables: string[];
 }
 

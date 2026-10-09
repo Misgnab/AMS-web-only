@@ -11,7 +11,6 @@ import type {
   DatabaseEngine
 } from "./databaseTypes.ts";
 import { MysqlDriver } from "./mysqlDriver.ts";
-import { SqliteDriver } from "./sqliteDriver.ts";
 import { DATABASE_TABLE_ORDER, generateMysqlSchemaSql } from "./mysqlSchema.ts";
 import { ensureMysqlRunning } from "./mysqlDaemon.ts";
 
@@ -43,11 +42,10 @@ function getResolvedConfigPath(): string {
 }
 
 export class DatabaseManager implements IDatabaseDriver {
-  public name: DatabaseEngine = "sqlite";
+  public name: DatabaseEngine = "mysql";
   private mysqlDriver: MysqlDriver;
-  private sqliteDriver: SqliteDriver;
   private activeDriver: IDatabaseDriver;
-  private effectiveEngine: DatabaseEngine = "sqlite";
+  private effectiveEngine: DatabaseEngine = "mysql";
   private isFallback = false;
   private config: DatabaseConfiguration;
   private onConnectedCallbacks: Array<() => void> = [];
@@ -63,14 +61,11 @@ export class DatabaseManager implements IDatabaseDriver {
       ensureMysqlRunning();
     } catch (_) {}
 
-    // 3. Initialize both driver instances
-    this.sqliteDriver = new SqliteDriver();
+    // 3. Initialize MySQL driver
     this.mysqlDriver = new MysqlDriver();
+    this.activeDriver = this.mysqlDriver;
 
-    // 4. Default active driver to SQLite for immediate reliability
-    this.activeDriver = this.sqliteDriver;
-
-    // 5. Connect and determine active vs fallback engine
+    // 4. Connect to MySQL
     this.connect();
   }
 
@@ -89,7 +84,6 @@ export class DatabaseManager implements IDatabaseDriver {
 
   private startReconnectLoop(): void {
     if (this.reconnectTimer) return;
-    // Do not continuously poll local 127.0.0.1/localhost if no local MySQL daemon is running
     if (["127.0.0.1", "localhost"].includes(this.config.mysql.host)) {
       return;
     }
@@ -119,14 +113,12 @@ export class DatabaseManager implements IDatabaseDriver {
           this.mysqlDriver.initSchema();
         } catch (_) {}
 
-        if (this.config.activeEngine === "mysql") {
-          this.activeDriver = this.mysqlDriver;
-          this.effectiveEngine = "mysql";
-          this.isFallback = false;
-          this.name = "mysql";
-          console.log(`[DatabaseManager] Connected to MySQL database (${this.config.mysql.host}:${this.config.mysql.port}/${this.config.mysql.database}).`);
-          this.notifyConnected();
-        }
+        this.activeDriver = this.mysqlDriver;
+        this.effectiveEngine = "mysql";
+        this.isFallback = false;
+        this.name = "mysql";
+        console.log(`[DatabaseManager] Connected to MySQL database (${this.config.mysql.host}:${this.config.mysql.port}/${this.config.mysql.database}).`);
+        this.notifyConnected();
 
         if (this.reconnectTimer) {
           clearInterval(this.reconnectTimer);
@@ -158,11 +150,8 @@ export class DatabaseManager implements IDatabaseDriver {
     const database = process.env.MYSQL_DATABASE || savedConfig?.mysql?.database || "buildtrack_ams";
     const ssl = process.env.MYSQL_SSL === "true" || !!savedConfig?.mysql?.ssl;
 
-    const requestedEngine = (savedConfig?.activeEngine || process.env.DB_TYPE || "sqlite").toLowerCase();
-    const activeEngine: DatabaseEngine = requestedEngine === "mysql" ? "mysql" : "sqlite";
-
     return {
-      activeEngine,
+      activeEngine: "mysql",
       mysql: {
         host,
         port,
@@ -176,17 +165,6 @@ export class DatabaseManager implements IDatabaseDriver {
   }
 
   public connect(): boolean {
-    if (this.config.activeEngine === "sqlite") {
-      this.activeDriver = this.sqliteDriver;
-      this.effectiveEngine = "sqlite";
-      this.isFallback = false;
-      this.name = "sqlite";
-      console.log("[DatabaseManager] Using SQLite database as configured.");
-      this.notifyConnected();
-      return true;
-    }
-
-    // Try connecting to MySQL
     const connected = this.mysqlDriver.init(this.config.mysql);
     if (connected) {
       try {
@@ -202,24 +180,17 @@ export class DatabaseManager implements IDatabaseDriver {
       this.notifyConnected();
       return true;
     } else {
-      // Graceful fallback to SQLite
-      this.activeDriver = this.sqliteDriver;
-      this.effectiveEngine = "sqlite";
-      this.isFallback = true;
-      this.name = "sqlite";
-      console.warn(`[DatabaseManager] MySQL connection unavailable (${this.mysqlDriver.getLastError()}). Operating safely on SQLite database.`);
-      this.notifyConnected();
+      this.activeDriver = this.mysqlDriver;
+      this.effectiveEngine = "mysql";
+      this.isFallback = false;
+      this.name = "mysql";
+      console.warn(`[DatabaseManager] MySQL connection unavailable (${this.mysqlDriver.getLastError()}). Waiting for valid credentials.`);
       this.startReconnectLoop();
-      return true;
+      return false;
     }
   }
 
   public initSchema(): void {
-    try {
-      this.sqliteDriver.initSchema();
-    } catch (e: any) {
-      console.warn("[DatabaseManager] SQLite schema warning:", e.message);
-    }
     if (this.mysqlDriver.isReady()) {
       try {
         this.mysqlDriver.initSchema();
@@ -231,7 +202,7 @@ export class DatabaseManager implements IDatabaseDriver {
 
   public applyConfiguration(newConfig: { activeEngine?: DatabaseEngine; mysql: MysqlConfig }): boolean {
     this.config = {
-      activeEngine: newConfig.activeEngine || "mysql",
+      activeEngine: "mysql",
       mysql: {
         host: newConfig.mysql.host || "127.0.0.1",
         port: Number(newConfig.mysql.port) || 3306,
@@ -260,7 +231,7 @@ export class DatabaseManager implements IDatabaseDriver {
           envContent += (envContent.endsWith("\n") || !envContent ? "" : "\n") + `${key}=${val}\n`;
         }
       };
-      setEnvVar("DB_TYPE", this.config.activeEngine);
+      setEnvVar("DB_TYPE", "mysql");
       setEnvVar("MYSQL_HOST", this.config.mysql.host);
       setEnvVar("MYSQL_PORT", String(this.config.mysql.port));
       setEnvVar("MYSQL_USER", this.config.mysql.user);
@@ -268,15 +239,6 @@ export class DatabaseManager implements IDatabaseDriver {
       setEnvVar("MYSQL_DATABASE", this.config.mysql.database);
       fs.writeFileSync(envPath, envContent);
     } catch (_) {}
-
-    if (this.config.activeEngine === "sqlite") {
-      this.activeDriver = this.sqliteDriver;
-      this.effectiveEngine = "sqlite";
-      this.isFallback = false;
-      this.name = "sqlite";
-      this.notifyConnected();
-      return true;
-    }
 
     const ok = this.mysqlDriver.init(this.config.mysql);
     if (ok) {
@@ -294,10 +256,6 @@ export class DatabaseManager implements IDatabaseDriver {
       return true;
     } else {
       console.warn(`[DatabaseManager] MySQL connection failed. Error: ${this.mysqlDriver.getLastError()}`);
-      this.activeDriver = this.sqliteDriver;
-      this.effectiveEngine = "sqlite";
-      this.isFallback = true;
-      this.name = "sqlite";
       return false;
     }
   }
@@ -342,20 +300,14 @@ export class DatabaseManager implements IDatabaseDriver {
     return this.mysqlDriver;
   }
 
-  public getSqliteDriver(): SqliteDriver {
-    return this.sqliteDriver;
-  }
-
   public getStatus(): DualDatabaseStatus {
     const mysqlStatus = this.mysqlDriver.getStatus();
-    const sqliteStatus = this.sqliteDriver.getStatus();
 
     return {
-      activeEngine: this.config.activeEngine,
-      effectiveEngine: this.effectiveEngine,
-      isFallback: this.isFallback,
+      activeEngine: "mysql",
+      effectiveEngine: "mysql",
+      isFallback: false,
       mysql: mysqlStatus,
-      sqlite: sqliteStatus,
       tables: [...DATABASE_TABLE_ORDER]
     };
   }
@@ -414,7 +366,6 @@ export class DatabaseManager implements IDatabaseDriver {
       this.reconnectTimer = null;
     }
     this.mysqlDriver.close();
-    this.sqliteDriver.close();
   }
 }
 
