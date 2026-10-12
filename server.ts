@@ -83,23 +83,41 @@ function getAddisAbabaYMD(date: Date = new Date()): { year: number, month: numbe
   return { year, month, day };
 }
 
-function getEthiopianDateString(date: Date = new Date()): string {
+function getEthiopianDateString(dateInput?: Date | string | null): string {
   try {
-    const g = getAddisAbabaYMD(date);
+    if (typeof dateInput === "string" && dateInput.includes("-")) {
+      const parts = dateInput.split("T")[0].split("-").map(Number);
+      if (parts.length === 3 && !parts.some(isNaN)) {
+        const [y, m, d] = parts;
+        // If already Ethiopian date (year <= 2023 or month 13): return as is!
+        if ((y >= 1900 && y <= 2023 && m >= 1 && m <= 13 && d >= 1 && d <= 30) || m === 13) {
+          return `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+        }
+        // If Gregorian date (year >= 2024):
+        const [ey, em, ed] = toEthiopian(y, m, d);
+        return `${ey}-${String(em).padStart(2, "0")}-${String(ed).padStart(2, "0")}`;
+      }
+    }
+    const d = dateInput instanceof Date ? dateInput : new Date();
+    const g = getAddisAbabaYMD(d);
     const [ey, em, ed] = toEthiopian(g.year, g.month, g.day);
     const mm = String(em).padStart(2, "0");
     const dd = String(ed).padStart(2, "0");
     return `${ey}-${mm}-${dd}`;
   } catch (err) {
     console.error("Error converting date to Ethiopian calendar:", err);
-    // Fallback to Gregorian in Addis Ababa timezone
-    const formatter = new Intl.DateTimeFormat('en-CA', {
-      timeZone: 'Africa/Addis_Ababa',
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit'
-    });
-    return formatter.format(date);
+    try {
+      const d = dateInput instanceof Date ? dateInput : new Date();
+      const formatter = new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Africa/Addis_Ababa',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit'
+      });
+      return formatter.format(d);
+    } catch (_) {
+      return "2019-01-01";
+    }
   }
 }
 
@@ -8147,6 +8165,27 @@ async function startServer() {
   server.on("upgrade", (_req, socket) => {
     socket.destroy();
   });
+
+  // Graceful shutdown handling for container and process orchestrators
+  const gracefulShutdown = (signal: string) => {
+    console.log(`[Server] Received ${signal}. Initiating graceful shutdown...`);
+    server.close(() => {
+      console.log("[Server] HTTP server stopped.");
+      try {
+        db.close?.();
+      } catch (_) {}
+      process.exit(0);
+    });
+
+    // Enforce shutdown after 10s if connections fail to drain
+    setTimeout(() => {
+      console.error("[Server] Forcefully terminating lingering connections.");
+      process.exit(1);
+    }, 10000).unref();
+  };
+
+  process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+  process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 }
 
 startServer();
