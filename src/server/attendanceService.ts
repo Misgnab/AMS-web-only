@@ -57,9 +57,15 @@ export class AttendanceService {
         afternoon_start_time: settings?.afternoon_start_time || "13:30",
         afternoon_end_time: settings?.afternoon_end_time || "17:30",
 
-        // 2. Check-in Rules
-        earliest_checkin_time: settings?.earliest_checkin_time || "07:00",
-        latest_checkin_time: settings?.latest_checkin_time || "10:30",
+        // 2. Check-in Rules (Both Morning & Afternoon Sessions)
+        earliest_checkin_time: settings?.morning_earliest_checkin_time || settings?.earliest_checkin_time || "07:00",
+        latest_checkin_time: settings?.morning_latest_checkin_time || settings?.latest_checkin_time || "10:30",
+        morning_earliest_checkin_time: settings?.morning_earliest_checkin_time || settings?.earliest_checkin_time || "07:00",
+        morning_latest_checkin_time: settings?.morning_latest_checkin_time || settings?.latest_checkin_time || "10:30",
+        morning_late_grace_minutes: Number(settings?.morning_late_grace_minutes ?? settings?.late_grace_minutes ?? 15),
+        afternoon_earliest_checkin_time: settings?.afternoon_earliest_checkin_time || "12:30",
+        afternoon_latest_checkin_time: settings?.afternoon_latest_checkin_time || "15:30",
+        afternoon_late_grace_minutes: Number(settings?.afternoon_late_grace_minutes ?? settings?.late_grace_minutes ?? 15),
         late_grace_minutes: Number(settings?.late_grace_minutes ?? 15),
         allowed_minor_lates: Number(settings?.allowed_minor_lates ?? 2),
         prevent_duplicate_checkin: Number(settings?.prevent_duplicate_checkin ?? 1),
@@ -67,17 +73,26 @@ export class AttendanceService {
         authorized_early_overtime_enabled: Number(settings?.authorized_early_overtime_enabled ?? 1),
         early_overtime_requires_approval: Number(settings?.early_overtime_requires_approval ?? 1),
 
-        // 3. Check-out Rules
-        earliest_checkout_time: settings?.earliest_checkout_time || "16:30",
-        latest_checkout_time: settings?.latest_checkout_time || "20:00",
+        // 3. Check-out Rules (Both Morning & Afternoon Sessions)
+        earliest_checkout_time: settings?.afternoon_earliest_checkout_time || settings?.earliest_checkout_time || "16:30",
+        latest_checkout_time: settings?.afternoon_latest_checkout_time || settings?.latest_checkout_time || "20:00",
         checkout_grace_minutes: Number(settings?.checkout_grace_minutes ?? 30),
+        morning_earliest_checkout_time: settings?.morning_earliest_checkout_time || "11:30",
+        morning_latest_checkout_time: settings?.morning_latest_checkout_time || "13:30",
+        morning_checkout_grace_minutes: Number(settings?.morning_checkout_grace_minutes ?? settings?.checkout_grace_minutes ?? 30),
+        afternoon_earliest_checkout_time: settings?.afternoon_earliest_checkout_time || settings?.earliest_checkout_time || "16:30",
+        afternoon_latest_checkout_time: settings?.afternoon_latest_checkout_time || settings?.latest_checkout_time || "20:00",
+        afternoon_checkout_grace_minutes: Number(settings?.afternoon_checkout_grace_minutes ?? settings?.checkout_grace_minutes ?? 30),
         prevent_checkout_without_checkin: Number(settings?.prevent_checkout_without_checkin ?? 1),
         prevent_duplicate_checkout: Number(settings?.prevent_duplicate_checkout ?? 1),
         missing_checkout_auto_overtime: Number(settings?.missing_checkout_auto_overtime ?? 0),
 
-        // 4. Overtime Rules
+        // 4. Overtime Rules (Both Morning & Afternoon Sessions)
         overtime_enabled: Number(settings?.overtime_enabled ?? 1),
-        overtime_start_time: settings?.overtime_start_time || "17:30",
+        overtime_start_time: settings?.afternoon_overtime_start_time || settings?.overtime_start_time || "17:30",
+        afternoon_overtime_start_time: settings?.afternoon_overtime_start_time || settings?.overtime_start_time || "17:30",
+        morning_overtime_enabled: Number(settings?.morning_overtime_enabled ?? 0),
+        afternoon_overtime_enabled: Number(settings?.afternoon_overtime_enabled ?? 1),
         min_overtime_minutes: Number(settings?.min_overtime_minutes ?? 30),
         max_overtime_daily_hours: Number(settings?.max_overtime_daily_hours ?? 4.0),
         max_overtime_weekly_hours: Number(settings?.max_overtime_weekly_hours ?? 12.0),
@@ -112,6 +127,12 @@ export class AttendanceService {
         afternoon_end_time: "17:30",
         earliest_checkin_time: "07:00",
         latest_checkin_time: "10:30",
+        morning_earliest_checkin_time: "07:00",
+        morning_latest_checkin_time: "10:30",
+        morning_late_grace_minutes: 15,
+        afternoon_earliest_checkin_time: "12:30",
+        afternoon_latest_checkin_time: "15:30",
+        afternoon_late_grace_minutes: 15,
         late_grace_minutes: 15,
         allowed_minor_lates: 2,
         prevent_duplicate_checkin: 1,
@@ -121,11 +142,20 @@ export class AttendanceService {
         earliest_checkout_time: "16:30",
         latest_checkout_time: "20:00",
         checkout_grace_minutes: 30,
+        morning_earliest_checkout_time: "11:30",
+        morning_latest_checkout_time: "13:30",
+        morning_checkout_grace_minutes: 30,
+        afternoon_earliest_checkout_time: "16:30",
+        afternoon_latest_checkout_time: "20:00",
+        afternoon_checkout_grace_minutes: 30,
         prevent_checkout_without_checkin: 1,
         prevent_duplicate_checkout: 1,
         missing_checkout_auto_overtime: 0,
         overtime_enabled: 1,
         overtime_start_time: "17:30",
+        afternoon_overtime_start_time: "17:30",
+        morning_overtime_enabled: 0,
+        afternoon_overtime_enabled: 1,
         min_overtime_minutes: 30,
         max_overtime_daily_hours: 4.0,
         max_overtime_weekly_hours: 12.0,
@@ -197,7 +227,7 @@ export class AttendanceService {
   static evaluateLateness(
     session: "Morning" | "Afternoon",
     ethiopianTimeStr: string,
-    lateGraceMinutes: number = 15,
+    lateGraceMinutes?: number,
     customStartMins?: number,
     workspaceId: number = 1
   ): { isLate: boolean; lateMinutes: number; isWithinGracePeriod?: boolean } {
@@ -205,9 +235,13 @@ export class AttendanceService {
       const [h, m] = ethiopianTimeStr.split(":").map(Number);
       const nowTotalMins = (h || 0) * 60 + (m || 0);
 
+      const settings = this.getSiteSettings(workspaceId);
+      const effectiveGrace = (lateGraceMinutes !== undefined && lateGraceMinutes !== null)
+        ? lateGraceMinutes
+        : (session === "Morning" ? (settings.morning_late_grace_minutes ?? 15) : (settings.afternoon_late_grace_minutes ?? 15));
+
       let baseStartMins = customStartMins;
       if (baseStartMins === undefined || baseStartMins === null) {
-        const settings = this.getSiteSettings(workspaceId);
         const startStr = session === "Morning" 
           ? (settings.morning_start_time || settings.work_start_time || "08:30") 
           : (settings.afternoon_start_time || "13:30");
@@ -217,7 +251,7 @@ export class AttendanceService {
         const ethH = (sh >= 6 && sh <= 23) ? ((sh - 6 + 24) % 24) : sh;
         baseStartMins = ethH * 60 + sm;
       }
-      const graceCutoffMins = baseStartMins + lateGraceMinutes;
+      const graceCutoffMins = baseStartMins + effectiveGrace;
 
       if (nowTotalMins > graceCutoffMins) {
         return {
@@ -261,12 +295,16 @@ export class AttendanceService {
       };
 
       const morningEndEthMins = parseSettingEthMins(settings.morning_end_time, 390);
-      const morningCutoffMins = morningEndEthMins + (settings.checkout_grace_minutes || 0);
+      const morningGrace = settings.morning_checkout_grace_minutes ?? settings.checkout_grace_minutes ?? 30;
+      const morningCutoffMins = settings.morning_latest_checkout_time
+        ? parseSettingEthMins(settings.morning_latest_checkout_time, 450)
+        : (morningEndEthMins + morningGrace);
 
       const afternoonEndEthMins = parseSettingEthMins(settings.afternoon_end_time || settings.work_end_time, 690);
-      const afternoonCutoffMins = settings.latest_checkout_time 
-        ? parseSettingEthMins(settings.latest_checkout_time, 720) 
-        : afternoonEndEthMins + (settings.checkout_grace_minutes || 0);
+      const afternoonGrace = settings.afternoon_checkout_grace_minutes ?? settings.checkout_grace_minutes ?? 30;
+      const afternoonCutoffMins = (settings.afternoon_latest_checkout_time || settings.latest_checkout_time)
+        ? parseSettingEthMins(settings.afternoon_latest_checkout_time || settings.latest_checkout_time, 720)
+        : (afternoonEndEthMins + afternoonGrace);
 
       // 1. Find all unclosed shifts from past dates (or today where elapsed time > maxDurationHours)
       const openRecords: any[] = db.prepare(`

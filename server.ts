@@ -64,6 +64,44 @@ app.use((req, res, next) => {
 });
 
 const JWT_SECRET = process.env.JWT_SECRET || "construction-company-secret-key-2026";
+if (process.env.NODE_ENV === "production" && (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32)) {
+  console.warn("⚠️ [SECURITY NOTICE] Production deployment detected without a custom 32+ character JWT_SECRET! Please supply a secure JWT_SECRET in your environment.");
+}
+
+// In-Memory Brute Force Login Protection
+interface LoginFailureRecord {
+  failures: number;
+  lockedUntil: number;
+}
+const loginAttemptMap = new Map<string, LoginFailureRecord>();
+
+function checkLoginRateLimit(key: string): { allowed: boolean; remainingSec?: number } {
+  const now = Date.now();
+  const rec = loginAttemptMap.get(key);
+  if (!rec) return { allowed: true };
+  if (rec.lockedUntil > now) {
+    return { allowed: false, remainingSec: Math.ceil((rec.lockedUntil - now) / 1000) };
+  }
+  if (rec.lockedUntil > 0 && rec.lockedUntil <= now) {
+    loginAttemptMap.delete(key);
+  }
+  return { allowed: true };
+}
+
+function recordLoginFailure(key: string) {
+  const now = Date.now();
+  const rec = loginAttemptMap.get(key) || { failures: 0, lockedUntil: 0 };
+  rec.failures += 1;
+  // If 5 consecutive failures, lock for 15 minutes (900 seconds)
+  if (rec.failures >= 5) {
+    rec.lockedUntil = now + 15 * 60 * 1000;
+  }
+  loginAttemptMap.set(key, rec);
+}
+
+function recordLoginSuccess(key: string) {
+  loginAttemptMap.delete(key);
+}
 
 // --- ETHIOPIAN TIMEZONE & CALENDAR HELPER FUNCTIONS (Africa/Addis_Ababa, UTC+3) ---
 function getAddisAbabaYMD(date: Date = new Date()): { year: number, month: number, day: number } {
@@ -658,6 +696,19 @@ app.post("/api/auth/login", (req: Request, res: Response) => {
     return res.status(400).json({ error: "Phone number and password are required" });
   }
 
+  const forwarded = req.headers["x-forwarded-for"];
+  const clientIp = typeof forwarded === "string" ? forwarded.split(",")[0].trim() : (req.socket.remoteAddress || "127.0.0.1");
+  const rateLimitKey = `${clientIp}:${String(phone_number).trim()}`;
+
+  const rateCheck = checkLoginRateLimit(rateLimitKey);
+  if (!rateCheck.allowed) {
+    return res.status(429).json({
+      error: `Too many failed login attempts. Access temporarily locked for security. Please try again in ${rateCheck.remainingSec} seconds.`,
+      code: "TOO_MANY_ATTEMPTS",
+      retryAfterSec: rateCheck.remainingSec
+    });
+  }
+
   try {
     const user: any = db.prepare(`
       SELECT u.*, w.name as workspace_name 
@@ -667,13 +718,17 @@ app.post("/api/auth/login", (req: Request, res: Response) => {
     `).get(phone_number);
 
     if (!user) {
+      recordLoginFailure(rateLimitKey);
       return res.status(400).json({ error: "Invalid phone number or password" });
     }
 
     const validPassword = bcrypt.compareSync(password, user.password);
     if (!validPassword) {
+      recordLoginFailure(rateLimitKey);
       return res.status(400).json({ error: "Invalid phone number or password" });
     }
+
+    recordLoginSuccess(rateLimitKey);
 
     const token = jwt.sign(
       { id: user.id, phone_number: user.phone_number, role: user.role, full_name: user.full_name, workspace_id: user.workspace_id },
@@ -1726,23 +1781,38 @@ app.put("/api/site-settings", authenticateToken, (req: AuthenticatedRequest, res
     morning_end_time,
     afternoon_start_time,
     afternoon_end_time,
-    // Check-in Rules
+    // Check-in Rules (Both Morning & Afternoon Sessions)
     earliest_checkin_time,
     latest_checkin_time,
+    morning_earliest_checkin_time,
+    morning_latest_checkin_time,
+    morning_late_grace_minutes,
+    afternoon_earliest_checkin_time,
+    afternoon_latest_checkin_time,
+    afternoon_late_grace_minutes,
     prevent_duplicate_checkin,
     early_arrival_as_overtime,
     authorized_early_overtime_enabled,
     early_overtime_requires_approval,
-    // Check-out Rules
+    // Check-out Rules (Both Morning & Afternoon Sessions)
     earliest_checkout_time,
     latest_checkout_time,
     checkout_grace_minutes,
+    morning_earliest_checkout_time,
+    morning_latest_checkout_time,
+    morning_checkout_grace_minutes,
+    afternoon_earliest_checkout_time,
+    afternoon_latest_checkout_time,
+    afternoon_checkout_grace_minutes,
     prevent_checkout_without_checkin,
     prevent_duplicate_checkout,
     missing_checkout_auto_overtime,
-    // Overtime Rules
+    // Overtime Rules (Morning & Afternoon Sessions)
     overtime_enabled,
     overtime_start_time,
+    afternoon_overtime_start_time,
+    morning_overtime_enabled,
+    afternoon_overtime_enabled,
     min_overtime_minutes,
     max_overtime_daily_hours,
     max_overtime_weekly_hours,
@@ -1779,11 +1849,29 @@ app.put("/api/site-settings", authenticateToken, (req: AuthenticatedRequest, res
     const effMorningEnd = morning_end_time !== undefined ? morning_end_time.trim() : (existing.morning_end_time || "12:30");
     const effAfternoonStart = afternoon_start_time !== undefined ? afternoon_start_time.trim() : (existing.afternoon_start_time || "13:30");
     const effAfternoonEnd = afternoon_end_time !== undefined ? afternoon_end_time.trim() : (existing.afternoon_end_time || "17:30");
-    const effEarliestCheckin = earliest_checkin_time !== undefined ? earliest_checkin_time.trim() : (existing.earliest_checkin_time || "07:00");
-    const effLatestCheckin = latest_checkin_time !== undefined ? latest_checkin_time.trim() : (existing.latest_checkin_time || "10:30");
-    const effEarliestCheckout = earliest_checkout_time !== undefined ? earliest_checkout_time.trim() : (existing.earliest_checkout_time || "16:30");
-    const effLatestCheckout = latest_checkout_time !== undefined ? latest_checkout_time.trim() : (existing.latest_checkout_time || "20:00");
-    const effOtStart = overtime_start_time !== undefined ? overtime_start_time.trim() : (existing.overtime_start_time || "17:30");
+
+    // Morning Session Check-in
+    const effMorningEarliestCheckin = morning_earliest_checkin_time !== undefined ? morning_earliest_checkin_time.trim() : (earliest_checkin_time !== undefined ? earliest_checkin_time.trim() : (existing.morning_earliest_checkin_time || existing.earliest_checkin_time || "07:00"));
+    const effMorningLatestCheckin = morning_latest_checkin_time !== undefined ? morning_latest_checkin_time.trim() : (latest_checkin_time !== undefined ? latest_checkin_time.trim() : (existing.morning_latest_checkin_time || existing.latest_checkin_time || "10:30"));
+    const effMorningLateGrace = morning_late_grace_minutes !== undefined && !isNaN(parseInt(morning_late_grace_minutes, 10)) ? parseInt(morning_late_grace_minutes, 10) : (late_grace_minutes !== undefined && !isNaN(parseInt(late_grace_minutes, 10)) ? parseInt(late_grace_minutes, 10) : (existing.morning_late_grace_minutes ?? existing.late_grace_minutes ?? 15));
+
+    // Afternoon Session Check-in
+    const effAfternoonEarliestCheckin = afternoon_earliest_checkin_time !== undefined ? afternoon_earliest_checkin_time.trim() : (existing.afternoon_earliest_checkin_time || "12:30");
+    const effAfternoonLatestCheckin = afternoon_latest_checkin_time !== undefined ? afternoon_latest_checkin_time.trim() : (existing.afternoon_latest_checkin_time || "15:30");
+    const effAfternoonLateGrace = afternoon_late_grace_minutes !== undefined && !isNaN(parseInt(afternoon_late_grace_minutes, 10)) ? parseInt(afternoon_late_grace_minutes, 10) : (existing.afternoon_late_grace_minutes ?? existing.late_grace_minutes ?? 15);
+
+    // Morning Session Check-out
+    const effMorningEarliestCheckout = morning_earliest_checkout_time !== undefined ? morning_earliest_checkout_time.trim() : (existing.morning_earliest_checkout_time || "11:30");
+    const effMorningLatestCheckout = morning_latest_checkout_time !== undefined ? morning_latest_checkout_time.trim() : (existing.morning_latest_checkout_time || "13:30");
+    const effMorningCheckoutGrace = morning_checkout_grace_minutes !== undefined && !isNaN(parseInt(morning_checkout_grace_minutes, 10)) ? parseInt(morning_checkout_grace_minutes, 10) : (existing.morning_checkout_grace_minutes ?? existing.checkout_grace_minutes ?? 30);
+
+    // Afternoon Session Check-out
+    const effAfternoonEarliestCheckout = afternoon_earliest_checkout_time !== undefined ? afternoon_earliest_checkout_time.trim() : (earliest_checkout_time !== undefined ? earliest_checkout_time.trim() : (existing.afternoon_earliest_checkout_time || existing.earliest_checkout_time || "16:30"));
+    const effAfternoonLatestCheckout = afternoon_latest_checkout_time !== undefined ? afternoon_latest_checkout_time.trim() : (latest_checkout_time !== undefined ? latest_checkout_time.trim() : (existing.afternoon_latest_checkout_time || existing.latest_checkout_time || "20:00"));
+    const effAfternoonCheckoutGrace = afternoon_checkout_grace_minutes !== undefined && !isNaN(parseInt(afternoon_checkout_grace_minutes, 10)) ? parseInt(afternoon_checkout_grace_minutes, 10) : (checkout_grace_minutes !== undefined && !isNaN(parseInt(checkout_grace_minutes, 10)) ? parseInt(checkout_grace_minutes, 10) : (existing.afternoon_checkout_grace_minutes ?? existing.checkout_grace_minutes ?? 30));
+
+    // Overtime
+    const effOtStart = afternoon_overtime_start_time !== undefined ? afternoon_overtime_start_time.trim() : (overtime_start_time !== undefined ? overtime_start_time.trim() : (existing.afternoon_overtime_start_time || existing.overtime_start_time || "17:30"));
     const effReqDailyHours = required_daily_hours !== undefined ? Number(required_daily_hours) : (existing.required_daily_hours ?? 8.0);
     const effMaxOtDaily = max_overtime_daily_hours !== undefined ? Number(max_overtime_daily_hours) : (existing.max_overtime_daily_hours ?? 4.0);
     const effMaxOtWeekly = max_overtime_weekly_hours !== undefined ? Number(max_overtime_weekly_hours) : (existing.max_overtime_weekly_hours ?? 12.0);
@@ -1807,20 +1895,37 @@ app.put("/api/site-settings", authenticateToken, (req: AuthenticatedRequest, res
     if (parseTime(effAfternoonStart) >= parseTime(effAfternoonEnd)) {
       return res.status(400).json({ error: "Validation Error: Afternoon session start must be earlier than afternoon session end." });
     }
-    if (effEarliestCheckin && parseTime(effEarliestCheckin) > parseTime(effWorkStart)) {
-      return res.status(400).json({ error: "Validation Error: Earliest allowed check-in cannot be later than normal check-in time." });
+
+    // Morning Session Validation
+    if (effMorningEarliestCheckin && parseTime(effMorningEarliestCheckin) > parseTime(effMorningStart)) {
+      return res.status(400).json({ error: "Validation Error: Morning earliest check-in cannot be later than morning start time." });
     }
-    if (effLatestCheckin && parseTime(effLatestCheckin) < parseTime(effWorkStart)) {
-      return res.status(400).json({ error: "Validation Error: Latest allowed check-in cutoff cannot be earlier than normal check-in time." });
+    if (effMorningLatestCheckin && parseTime(effMorningLatestCheckin) < parseTime(effMorningStart)) {
+      return res.status(400).json({ error: "Validation Error: Morning latest check-in cutoff cannot be earlier than morning start time." });
     }
-    if (effEarliestCheckout && parseTime(effEarliestCheckout) > parseTime(effWorkEnd)) {
-      return res.status(400).json({ error: "Validation Error: Earliest allowed check-out cannot be after normal check-out time." });
+    if (effMorningEarliestCheckout && parseTime(effMorningEarliestCheckout) > parseTime(effMorningEnd)) {
+      return res.status(400).json({ error: "Validation Error: Morning earliest check-out cannot be after morning session end." });
     }
-    if (effLatestCheckout && parseTime(effLatestCheckout) < parseTime(effWorkEnd)) {
-      return res.status(400).json({ error: "Validation Error: Latest allowed check-out cutoff cannot be earlier than normal check-out time." });
+    if (effMorningLatestCheckout && parseTime(effMorningLatestCheckout) < parseTime(effMorningEnd)) {
+      return res.status(400).json({ error: "Validation Error: Morning latest check-out cutoff cannot be earlier than morning session end." });
     }
-    if (effOtStart && parseTime(effOtStart) < parseTime(effWorkEnd)) {
-      return res.status(400).json({ error: "Validation Error: Overtime start time cannot be earlier than normal check-out time." });
+
+    // Afternoon Session Validation
+    if (effAfternoonEarliestCheckin && parseTime(effAfternoonEarliestCheckin) > parseTime(effAfternoonStart)) {
+      return res.status(400).json({ error: "Validation Error: Afternoon earliest check-in cannot be later than afternoon start time." });
+    }
+    if (effAfternoonLatestCheckin && parseTime(effAfternoonLatestCheckin) < parseTime(effAfternoonStart)) {
+      return res.status(400).json({ error: "Validation Error: Afternoon latest check-in cutoff cannot be earlier than afternoon start time." });
+    }
+    if (effAfternoonEarliestCheckout && parseTime(effAfternoonEarliestCheckout) > parseTime(effAfternoonEnd)) {
+      return res.status(400).json({ error: "Validation Error: Afternoon earliest check-out cannot be after afternoon session end." });
+    }
+    if (effAfternoonLatestCheckout && parseTime(effAfternoonLatestCheckout) < parseTime(effAfternoonEnd)) {
+      return res.status(400).json({ error: "Validation Error: Afternoon latest check-out cutoff cannot be earlier than afternoon session end." });
+    }
+
+    if (effOtStart && parseTime(effOtStart) < parseTime(effAfternoonEnd)) {
+      return res.status(400).json({ error: "Validation Error: Overtime start time cannot be earlier than afternoon check-out time." });
     }
     // Ethiopian Labour Proclamation No. 1156/2019 checks
     if (effReqDailyHours > 10.0 || effReqDailyHours <= 0) {
@@ -1832,10 +1937,10 @@ app.put("/api/site-settings", authenticateToken, (req: AuthenticatedRequest, res
     if (effMaxOtWeekly > 12.0 || effMaxOtWeekly < effMaxOtDaily) {
       return res.status(400).json({ error: "Validation Error: Under Ethiopian Labour Proclamation No. 1156/2019 Art. 67, weekly overtime shall not exceed 12 hours, nor be less than daily overtime." });
     }
-    if (late_grace_minutes !== undefined && Number(late_grace_minutes) < 0) {
+    if (effMorningLateGrace < 0 || effAfternoonLateGrace < 0) {
       return res.status(400).json({ error: "Validation Error: Check-in grace period cannot be negative." });
     }
-    if (checkout_grace_minutes !== undefined && Number(checkout_grace_minutes) < 0) {
+    if (effMorningCheckoutGrace < 0 || effAfternoonCheckoutGrace < 0) {
       return res.status(400).json({ error: "Validation Error: Checkout grace period cannot be negative." });
     }
     if (min_overtime_minutes !== undefined && Number(min_overtime_minutes) < 0) {
@@ -1852,7 +1957,6 @@ app.put("/api/site-settings", authenticateToken, (req: AuthenticatedRequest, res
     const cleanOfficeBssid = office_wifi_bssid !== undefined ? office_wifi_bssid.trim() : (existing.office_wifi_bssid || "00:11:22:33:44:55");
     const cleanWifiIp = wifi_ip !== undefined ? wifi_ip.trim() : (existing.wifi_ip || "");
     const cleanUseWifi = use_wifi_verification !== undefined ? (use_wifi_verification ? 1 : 0) : (existing.use_wifi_verification ?? 1);
-    const cleanLateGrace = late_grace_minutes !== undefined && !isNaN(parseInt(late_grace_minutes, 10)) ? parseInt(late_grace_minutes, 10) : (existing.late_grace_minutes ?? 15);
     const cleanAllowedMinorLates = allowed_minor_lates !== undefined && !isNaN(parseInt(allowed_minor_lates, 10)) ? parseInt(allowed_minor_lates, 10) : (existing.allowed_minor_lates ?? 2);
     const cleanPunctualityBonus = punctuality_bonus_amount !== undefined && !isNaN(parseFloat(punctuality_bonus_amount)) ? parseFloat(punctuality_bonus_amount) : (existing.punctuality_bonus_amount ?? 500.0);
     const cleanMaxShiftDuration = max_shift_duration_hours !== undefined && !isNaN(parseFloat(max_shift_duration_hours)) ? parseFloat(max_shift_duration_hours) : (existing.max_shift_duration_hours ?? 14.0);
@@ -1871,25 +1975,41 @@ app.put("/api/site-settings", authenticateToken, (req: AuthenticatedRequest, res
     const cleanAfternoonStart = effAfternoonStart;
     const cleanAfternoonEnd = effAfternoonEnd;
 
-    // Check-in Rules Values
-    const cleanEarliestCheckin = earliest_checkin_time !== undefined ? earliest_checkin_time.trim() : (existing.earliest_checkin_time || "07:00");
-    const cleanLatestCheckin = latest_checkin_time !== undefined ? latest_checkin_time.trim() : (existing.latest_checkin_time || "10:30");
+    // Check-in Rules Values (Both Morning & Afternoon)
+    const cleanMorningEarliestCheckin = effMorningEarliestCheckin;
+    const cleanMorningLatestCheckin = effMorningLatestCheckin;
+    const cleanMorningLateGrace = effMorningLateGrace;
+    const cleanAfternoonEarliestCheckin = effAfternoonEarliestCheckin;
+    const cleanAfternoonLatestCheckin = effAfternoonLatestCheckin;
+    const cleanAfternoonLateGrace = effAfternoonLateGrace;
+    const cleanEarliestCheckin = effMorningEarliestCheckin;
+    const cleanLatestCheckin = effMorningLatestCheckin;
+    const cleanLateGrace = effMorningLateGrace;
     const cleanPreventDupCheckin = prevent_duplicate_checkin !== undefined ? (prevent_duplicate_checkin ? 1 : 0) : (existing.prevent_duplicate_checkin ?? 1);
     const cleanEarlyArrivalOt = early_arrival_as_overtime !== undefined ? (early_arrival_as_overtime ? 1 : 0) : (existing.early_arrival_as_overtime ?? 0);
     const cleanAuthEarlyOt = authorized_early_overtime_enabled !== undefined ? (authorized_early_overtime_enabled ? 1 : 0) : (existing.authorized_early_overtime_enabled ?? 1);
     const cleanEarlyOtRequiresApproval = early_overtime_requires_approval !== undefined ? (early_overtime_requires_approval ? 1 : 0) : (existing.early_overtime_requires_approval ?? 1);
 
-    // Check-out Rules Values
-    const cleanEarliestCheckout = earliest_checkout_time !== undefined ? earliest_checkout_time.trim() : (existing.earliest_checkout_time || "16:30");
-    const cleanLatestCheckout = latest_checkout_time !== undefined ? latest_checkout_time.trim() : (existing.latest_checkout_time || "20:00");
-    const cleanCheckoutGrace = checkout_grace_minutes !== undefined && !isNaN(parseInt(checkout_grace_minutes, 10)) ? parseInt(checkout_grace_minutes, 10) : (existing.checkout_grace_minutes ?? 30);
+    // Check-out Rules Values (Both Morning & Afternoon)
+    const cleanMorningEarliestCheckout = effMorningEarliestCheckout;
+    const cleanMorningLatestCheckout = effMorningLatestCheckout;
+    const cleanMorningCheckoutGrace = effMorningCheckoutGrace;
+    const cleanAfternoonEarliestCheckout = effAfternoonEarliestCheckout;
+    const cleanAfternoonLatestCheckout = effAfternoonLatestCheckout;
+    const cleanAfternoonCheckoutGrace = effAfternoonCheckoutGrace;
+    const cleanEarliestCheckout = effAfternoonEarliestCheckout;
+    const cleanLatestCheckout = effAfternoonLatestCheckout;
+    const cleanCheckoutGrace = effAfternoonCheckoutGrace;
     const cleanPreventCheckoutNoCheckin = prevent_checkout_without_checkin !== undefined ? (prevent_checkout_without_checkin ? 1 : 0) : (existing.prevent_checkout_without_checkin ?? 1);
     const cleanPreventDupCheckout = prevent_duplicate_checkout !== undefined ? (prevent_duplicate_checkout ? 1 : 0) : (existing.prevent_duplicate_checkout ?? 1);
     const cleanMissingCheckoutOt = missing_checkout_auto_overtime !== undefined ? (missing_checkout_auto_overtime ? 1 : 0) : (existing.missing_checkout_auto_overtime ?? 0);
 
-    // Overtime Rules Values
+    // Overtime Rules Values (Both Morning & Afternoon)
     const cleanOtEnabled = overtime_enabled !== undefined ? (overtime_enabled ? 1 : 0) : (existing.overtime_enabled ?? 1);
-    const cleanOtStartTime = overtime_start_time !== undefined ? overtime_start_time.trim() : (existing.overtime_start_time || "17:30");
+    const cleanOtStartTime = effOtStart;
+    const cleanAfternoonOtStartTime = effOtStart;
+    const cleanMorningOtEnabled = morning_overtime_enabled !== undefined ? (morning_overtime_enabled ? 1 : 0) : (existing.morning_overtime_enabled ?? 0);
+    const cleanAfternoonOtEnabled = afternoon_overtime_enabled !== undefined ? (afternoon_overtime_enabled ? 1 : 0) : (existing.afternoon_overtime_enabled ?? 1);
     const cleanMinOtMins = min_overtime_minutes !== undefined && !isNaN(parseInt(min_overtime_minutes, 10)) ? parseInt(min_overtime_minutes, 10) : (existing.min_overtime_minutes ?? 30);
     const cleanMaxDailyOt = max_overtime_daily_hours !== undefined && !isNaN(parseFloat(max_overtime_daily_hours)) ? parseFloat(max_overtime_daily_hours) : (existing.max_overtime_daily_hours ?? 4.0);
     const cleanMaxWeeklyOt = max_overtime_weekly_hours !== undefined && !isNaN(parseFloat(max_overtime_weekly_hours)) ? parseFloat(max_overtime_weekly_hours) : (existing.max_overtime_weekly_hours ?? 12.0);
@@ -1906,6 +2026,8 @@ app.put("/api/site-settings", authenticateToken, (req: AuthenticatedRequest, res
           wifi_ip = ?, 
           use_wifi_verification = ?,
           late_grace_minutes = ?,
+          morning_late_grace_minutes = ?,
+          afternoon_late_grace_minutes = ?,
           allowed_minor_lates = ?,
           punctuality_bonus_amount = ?,
           max_shift_duration_hours = ?,
@@ -1923,6 +2045,10 @@ app.put("/api/site-settings", authenticateToken, (req: AuthenticatedRequest, res
           afternoon_end_time = ?,
           earliest_checkin_time = ?,
           latest_checkin_time = ?,
+          morning_earliest_checkin_time = ?,
+          morning_latest_checkin_time = ?,
+          afternoon_earliest_checkin_time = ?,
+          afternoon_latest_checkin_time = ?,
           prevent_duplicate_checkin = ?,
           early_arrival_as_overtime = ?,
           authorized_early_overtime_enabled = ?,
@@ -1930,11 +2056,20 @@ app.put("/api/site-settings", authenticateToken, (req: AuthenticatedRequest, res
           earliest_checkout_time = ?,
           latest_checkout_time = ?,
           checkout_grace_minutes = ?,
+          morning_earliest_checkout_time = ?,
+          morning_latest_checkout_time = ?,
+          morning_checkout_grace_minutes = ?,
+          afternoon_earliest_checkout_time = ?,
+          afternoon_latest_checkout_time = ?,
+          afternoon_checkout_grace_minutes = ?,
           prevent_checkout_without_checkin = ?,
           prevent_duplicate_checkout = ?,
           missing_checkout_auto_overtime = ?,
           overtime_enabled = ?,
           overtime_start_time = ?,
+          afternoon_overtime_start_time = ?,
+          morning_overtime_enabled = ?,
+          afternoon_overtime_enabled = ?,
           min_overtime_minutes = ?,
           max_overtime_daily_hours = ?,
           max_overtime_weekly_hours = ?,
@@ -1951,6 +2086,8 @@ app.put("/api/site-settings", authenticateToken, (req: AuthenticatedRequest, res
       cleanWifiIp,
       cleanUseWifi,
       cleanLateGrace,
+      cleanMorningLateGrace,
+      cleanAfternoonLateGrace,
       cleanAllowedMinorLates,
       cleanPunctualityBonus,
       cleanMaxShiftDuration,
@@ -1968,6 +2105,10 @@ app.put("/api/site-settings", authenticateToken, (req: AuthenticatedRequest, res
       cleanAfternoonEnd,
       cleanEarliestCheckin,
       cleanLatestCheckin,
+      cleanMorningEarliestCheckin,
+      cleanMorningLatestCheckin,
+      cleanAfternoonEarliestCheckin,
+      cleanAfternoonLatestCheckin,
       cleanPreventDupCheckin,
       cleanEarlyArrivalOt,
       cleanAuthEarlyOt,
@@ -1975,11 +2116,20 @@ app.put("/api/site-settings", authenticateToken, (req: AuthenticatedRequest, res
       cleanEarliestCheckout,
       cleanLatestCheckout,
       cleanCheckoutGrace,
+      cleanMorningEarliestCheckout,
+      cleanMorningLatestCheckout,
+      cleanMorningCheckoutGrace,
+      cleanAfternoonEarliestCheckout,
+      cleanAfternoonLatestCheckout,
+      cleanAfternoonCheckoutGrace,
       cleanPreventCheckoutNoCheckin,
       cleanPreventDupCheckout,
       cleanMissingCheckoutOt,
       cleanOtEnabled,
       cleanOtStartTime,
+      cleanAfternoonOtStartTime,
+      cleanMorningOtEnabled,
+      cleanAfternoonOtEnabled,
       cleanMinOtMins,
       cleanMaxDailyOt,
       cleanMaxWeeklyOt,
@@ -4264,41 +4414,55 @@ app.post("/api/attendance/check-in", authenticateToken, (req: AuthenticatedReque
     calculatedDistance = gpsEval.distance;
     gpsAccuracy = gpsEval.accuracy;
 
-    // 1. Enforce Earliest Allowed Check-in Time
-    if (siteSettings.earliest_checkin_time && activeSession === "Morning") {
-      const earliestEthMins = settingTimeToEthMins(siteSettings.earliest_checkin_time);
+    // 1. Enforce Earliest Allowed Check-in Time (Both Morning & Afternoon Sessions)
+    const earliestCheckinStr = activeSession === "Morning"
+      ? (siteSettings.morning_earliest_checkin_time || siteSettings.earliest_checkin_time || "07:00")
+      : (siteSettings.afternoon_earliest_checkin_time || "12:30");
+
+    if (earliestCheckinStr) {
+      const earliestEthMins = settingTimeToEthMins(earliestCheckinStr);
       if (nowTotalMins < earliestEthMins) {
         return res.status(400).json({
-          error: `Check-in restriction: Early check-in is not permitted before ${siteSettings.earliest_checkin_time}. Company policy restricts check-in prior to this window.`,
+          error: `Check-in restriction: Early check-in for ${activeSession} session is not permitted before ${earliestCheckinStr}. Company policy restricts check-in prior to this window.`,
           code: "EARLIEST_CHECKIN_RESTRICTION",
-          earliest_allowed: siteSettings.earliest_checkin_time
+          earliest_allowed: earliestCheckinStr,
+          session: activeSession
         });
       }
     }
 
-    // 2. Enforce Latest Allowed Check-in Cutoff
-    if (siteSettings.latest_checkin_time && activeSession === "Morning") {
-      const latestEthMins = settingTimeToEthMins(siteSettings.latest_checkin_time);
+    // 2. Enforce Latest Allowed Check-in Cutoff (Both Morning & Afternoon Sessions)
+    const latestCheckinStr = activeSession === "Morning"
+      ? (siteSettings.morning_latest_checkin_time || siteSettings.latest_checkin_time || "10:30")
+      : (siteSettings.afternoon_latest_checkin_time || "15:30");
+
+    if (latestCheckinStr) {
+      const latestEthMins = settingTimeToEthMins(latestCheckinStr);
       if (nowTotalMins > latestEthMins) {
         return res.status(400).json({
-          error: `Check-in restriction: Check-in window closed at ${siteSettings.latest_checkin_time}. Company policy restricts check-ins after this cutoff time.`,
+          error: `Check-in restriction: ${activeSession} session check-in window closed at ${latestCheckinStr}. Company policy restricts check-ins after this cutoff time.`,
           code: "LATEST_CHECKIN_RESTRICTION",
-          latest_allowed: siteSettings.latest_checkin_time
+          latest_allowed: latestCheckinStr,
+          session: activeSession
         });
       }
     }
 
     // 3. Scheduled session start & lateness evaluation
     const scheduledStartStr = activeSession === "Morning" 
-      ? (siteSettings.morning_start_time || siteSettings.work_start_time) 
-      : siteSettings.afternoon_start_time;
+      ? (siteSettings.morning_start_time || siteSettings.work_start_time || "08:30") 
+      : (siteSettings.afternoon_start_time || "13:30");
     const scheduledStartEthMins = settingTimeToEthMins(scheduledStartStr);
+    const sessionGraceMins = activeSession === "Morning"
+      ? (siteSettings.morning_late_grace_minutes ?? siteSettings.late_grace_minutes ?? 15)
+      : (siteSettings.afternoon_late_grace_minutes ?? siteSettings.late_grace_minutes ?? 15);
 
     const lateness = AttendanceService.evaluateLateness(
       activeSession, 
       nowTimeStr, 
-      siteSettings.late_grace_minutes,
-      scheduledStartEthMins
+      sessionGraceMins,
+      scheduledStartEthMins,
+      workspaceId
     );
     const status = lateness.isLate ? "Late" : "Present";
     const lateMinutes = lateness.lateMinutes || 0;
@@ -4527,22 +4691,31 @@ app.post("/api/attendance/check-out", authenticateToken, (req: AuthenticatedRequ
       return ethH * 60 + m;
     };
 
-    const morningEndEthMins = settingTimeToEthMins(siteSettings.morning_end_time, 390);
-    const morningCheckoutCutoff = morningEndEthMins + (siteSettings.checkout_grace_minutes || 0);
+    const morningEndEthMins = settingTimeToEthMins(siteSettings.morning_end_time || "12:30", 390);
+    const morningGrace = siteSettings.morning_checkout_grace_minutes ?? siteSettings.checkout_grace_minutes ?? 30;
+    const morningCheckoutCutoff = siteSettings.morning_latest_checkout_time
+      ? settingTimeToEthMins(siteSettings.morning_latest_checkout_time, 450)
+      : morningEndEthMins + morningGrace;
 
-    const afternoonEndEthMins = settingTimeToEthMins(siteSettings.afternoon_end_time || siteSettings.work_end_time, 690);
-    const afternoonCheckoutCutoff = siteSettings.latest_checkout_time 
-      ? settingTimeToEthMins(siteSettings.latest_checkout_time, 720) 
-      : afternoonEndEthMins + (siteSettings.checkout_grace_minutes || 0);
+    const afternoonEndEthMins = settingTimeToEthMins(siteSettings.afternoon_end_time || siteSettings.work_end_time || "17:30", 690);
+    const afternoonGrace = siteSettings.afternoon_checkout_grace_minutes ?? siteSettings.checkout_grace_minutes ?? 30;
+    const afternoonCheckoutCutoff = (siteSettings.afternoon_latest_checkout_time || siteSettings.latest_checkout_time)
+      ? settingTimeToEthMins(siteSettings.afternoon_latest_checkout_time || siteSettings.latest_checkout_time, 720)
+      : afternoonEndEthMins + afternoonGrace;
 
-    // Enforce earliest allowed checkout if configured:
-    if (siteSettings.earliest_checkout_time && record.session === "Afternoon") {
-      const earliestCheckoutEthMins = settingTimeToEthMins(siteSettings.earliest_checkout_time);
+    // Enforce earliest allowed checkout for the active record session:
+    const earliestCheckoutStr = record.session === "Morning"
+      ? (siteSettings.morning_earliest_checkout_time || "11:30")
+      : (siteSettings.afternoon_earliest_checkout_time || siteSettings.earliest_checkout_time || "16:30");
+
+    if (earliestCheckoutStr) {
+      const earliestCheckoutEthMins = settingTimeToEthMins(earliestCheckoutStr);
       if (nowTotalMins < earliestCheckoutEthMins) {
         return res.status(400).json({
-          error: `Checkout restriction: Early checkout is not permitted before ${siteSettings.earliest_checkout_time}. Company policy restricts checkout prior to this window.`,
+          error: `Checkout restriction: Early checkout for ${record.session} session is not permitted before ${earliestCheckoutStr}. Company policy restricts checkout prior to this window.`,
           code: "EARLIEST_CHECKOUT_RESTRICTION",
-          earliest_allowed: siteSettings.earliest_checkout_time
+          earliest_allowed: earliestCheckoutStr,
+          session: record.session
         });
       }
     }

@@ -160,6 +160,23 @@ export default defineConfig(() => {
               }
               return 'vendor-deps';
             }
+            if (id.includes('src/components/')) {
+              if (id.includes('LatePenaltyManagement') || id.includes('EmployeePenaltiesModal')) {
+                return 'tab-penalties';
+              }
+              if (id.includes('SalaryManagementTab') || id.includes('SalaryReportTab') || id.includes('EnterprisePayslipModal') || id.includes('SalaryBreakdownModal') || id.includes('SalaryPaymentConfirmationModal') || id.includes('EditCompensationModal')) {
+                return 'tab-salaries';
+              }
+              if (id.includes('OvertimeManagementTab') || id.includes('EmployeeOvertimeModal')) {
+                return 'tab-overtime';
+              }
+              if (id.includes('WorkCalendarTab') || id.includes('AttendanceScheduleSettingsTab') || id.includes('WorkingDayStatusCard')) {
+                return 'tab-calendar';
+              }
+              if (id.includes('MissingCheckoutManagement') || id.includes('MissingCheckoutModal') || id.includes('ForgottenCheckoutAlert')) {
+                return 'tab-checkout-audit';
+              }
+            }
           },
         },
       },

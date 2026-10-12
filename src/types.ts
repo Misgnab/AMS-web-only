@@ -61,25 +61,40 @@ export interface SiteSettings {
   afternoon_start_time?: string; // e.g. "13:30"
   afternoon_end_time?: string; // e.g. "17:30"
 
-  // Check-in Rules
-  earliest_checkin_time?: string; // e.g. "07:00"
-  latest_checkin_time?: string; // e.g. "10:30"
+  // Check-in Rules (Both Morning & Afternoon Sessions)
+  earliest_checkin_time?: string; // Legacy/Fallback
+  latest_checkin_time?: string; // Legacy/Fallback
+  morning_earliest_checkin_time?: string; // e.g. "07:00"
+  morning_latest_checkin_time?: string; // e.g. "10:30"
+  morning_late_grace_minutes?: number; // e.g. 15
+  afternoon_earliest_checkin_time?: string; // e.g. "12:30"
+  afternoon_latest_checkin_time?: string; // e.g. "15:30"
+  afternoon_late_grace_minutes?: number; // e.g. 15
   prevent_duplicate_checkin?: number | boolean;
   early_arrival_as_overtime?: number | boolean; // default false: arriving early != overtime
   authorized_early_overtime_enabled?: number | boolean;
   early_overtime_requires_approval?: number | boolean;
 
-  // Check-out Rules
-  earliest_checkout_time?: string; // e.g. "16:30"
-  latest_checkout_time?: string; // e.g. "20:00"
-  checkout_grace_minutes?: number;
+  // Check-out Rules (Both Morning & Afternoon Sessions)
+  earliest_checkout_time?: string; // Legacy/Fallback
+  latest_checkout_time?: string; // Legacy/Fallback
+  checkout_grace_minutes?: number; // Legacy/Fallback
+  morning_earliest_checkout_time?: string; // e.g. "11:30"
+  morning_latest_checkout_time?: string; // e.g. "13:30"
+  morning_checkout_grace_minutes?: number; // e.g. 30
+  afternoon_earliest_checkout_time?: string; // e.g. "16:30"
+  afternoon_latest_checkout_time?: string; // e.g. "20:00"
+  afternoon_checkout_grace_minutes?: number; // e.g. 30
   prevent_checkout_without_checkin?: number | boolean;
   prevent_duplicate_checkout?: number | boolean;
   missing_checkout_auto_overtime?: number | boolean; // default false: missing checkout NEVER creates overtime
 
-  // Overtime Rules & Policies
+  // Overtime Rules & Policies (Morning & Afternoon Sessions)
   overtime_enabled?: number | boolean;
   overtime_start_time?: string; // e.g. "17:30"
+  afternoon_overtime_start_time?: string; // e.g. "17:30"
+  morning_overtime_enabled?: number | boolean;
+  afternoon_overtime_enabled?: number | boolean;
   min_overtime_minutes?: number;
   max_overtime_daily_hours?: number;
   max_overtime_weekly_hours?: number;
