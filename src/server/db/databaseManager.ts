@@ -11,6 +11,7 @@ import type {
   DatabaseEngine
 } from "./databaseTypes.ts";
 import { MysqlDriver } from "./mysqlDriver.ts";
+import { MemoryDriver } from "./memoryDriver.ts";
 import { DATABASE_TABLE_ORDER, generateMysqlSchemaSql } from "./mysqlSchema.ts";
 import { ensureMysqlRunning } from "./mysqlDaemon.ts";
 
@@ -44,6 +45,7 @@ function getResolvedConfigPath(): string {
 export class DatabaseManager implements IDatabaseDriver {
   public name: DatabaseEngine = "mysql";
   private mysqlDriver: MysqlDriver;
+  private memoryDriver: MemoryDriver;
   private activeDriver: IDatabaseDriver;
   private effectiveEngine: DatabaseEngine = "mysql";
   private isFallback = false;
@@ -61,11 +63,12 @@ export class DatabaseManager implements IDatabaseDriver {
       ensureMysqlRunning();
     } catch (_) {}
 
-    // 3. Initialize MySQL driver
+    // 3. Initialize MySQL driver and in-memory mock driver
     this.mysqlDriver = new MysqlDriver();
-    this.activeDriver = this.mysqlDriver;
+    this.memoryDriver = new MemoryDriver();
+    this.activeDriver = this.memoryDriver;
 
-    // 4. Connect to MySQL
+    // 4. Connect to MySQL or fall back to MemoryDriver
     this.connect();
   }
 
@@ -180,22 +183,26 @@ export class DatabaseManager implements IDatabaseDriver {
       this.notifyConnected();
       return true;
     } else {
-      this.activeDriver = this.mysqlDriver;
+      this.activeDriver = this.memoryDriver;
       this.effectiveEngine = "mysql";
-      this.isFallback = false;
+      this.isFallback = true;
       this.name = "mysql";
-      console.warn(`[DatabaseManager] MySQL connection unavailable (${this.mysqlDriver.getLastError()}). Waiting for valid credentials.`);
+      console.log(`[DatabaseManager] MySQL connection unavailable (${this.mysqlDriver.getLastError()}). In-Memory Mock Database Driver active.`);
+      try {
+        this.memoryDriver.initSchema();
+      } catch (_) {}
+      this.notifyConnected();
       this.startReconnectLoop();
-      return false;
+      return true;
     }
   }
 
   public initSchema(): void {
-    if (this.mysqlDriver.isReady()) {
+    if (this.activeDriver && typeof this.activeDriver.initSchema === "function") {
       try {
-        this.mysqlDriver.initSchema();
+        this.activeDriver.initSchema();
       } catch (e: any) {
-        console.warn("[DatabaseManager] MySQL schema warning:", e.message);
+        console.warn("[DatabaseManager] Schema initialization warning:", e.message);
       }
     }
   }
@@ -306,7 +313,7 @@ export class DatabaseManager implements IDatabaseDriver {
     return {
       activeEngine: "mysql",
       effectiveEngine: "mysql",
-      isFallback: false,
+      isFallback: this.isFallback,
       mysql: mysqlStatus,
       tables: [...DATABASE_TABLE_ORDER]
     };

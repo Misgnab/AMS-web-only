@@ -55,46 +55,63 @@ export function useRealtimeSync(): RealtimeSyncState {
 
   // Universal state refresh that honors current dashboard & salary filters
   const refreshAllData = useCallback(() => {
+    if (typeof navigator !== "undefined" && !navigator.onLine) return;
     const store = useAppStore.getState();
+    if (!store.token) return;
     const role = store.user?.role || "";
     const isAdmin = ["SuperAdmin", "AdminCreator", "AdminManager", "Bootstrap", "Accountant", "HR"].includes(role);
 
     lastSyncTimeRef.current = Date.now();
 
-    // Common operational metrics for all users
+    // Stage 1: Core site and calendar settings
     store.fetchWorkCalendar();
     store.fetchHolidays();
     store.fetchSiteSettings();
-    store.fetchTodayAttendance();
-    store.fetchAttendanceHistory();
-    store.fetchAttendanceStatus();
-    store.fetchScores();
-    store.fetchMissingCheckouts();
-    store.fetchAttendanceCorrections();
-    store.fetchWorkCalendarStatus();
-    store.fetchQRCode();
 
-    // Admin & Management specific metrics
+    // Stage 2: Operational attendance data
+    setTimeout(() => {
+      store.fetchTodayAttendance();
+      store.fetchAttendanceHistory();
+      store.fetchAttendanceStatus();
+      store.fetchScores();
+    }, 60);
+
+    // Stage 3: Corrections and calendar status
+    setTimeout(() => {
+      store.fetchMissingCheckouts();
+      store.fetchAttendanceCorrections();
+      store.fetchWorkCalendarStatus();
+      store.fetchQRCode();
+    }, 120);
+
+    // Stage 4: Admin metrics or personal salary
     if (isAdmin) {
-      const activeDash = store.activeDashboardFilter || "Today";
-      const activeSal = store.activeSalaryFilter || "Monthly";
-      store.fetchDashboard(activeDash);
-      store.fetchSalaries(activeSal);
-      store.fetchAttendanceRequests();
-      store.fetchPermissions();
-      store.fetchAttendanceAuditLogs();
-      store.fetchOvertimeStats();
-      store.fetchOvertimeRecords();
-      store.fetchPenalties();
-      store.fetchEmployees();
-      store.fetchPayrollPreflightCheck();
-      store.fetchDisbursementHistory();
-      store.fetchDatabaseStatus();
+      setTimeout(() => {
+        const activeDash = store.activeDashboardFilter || "Today";
+        const activeSal = store.activeSalaryFilter || "Monthly";
+        store.fetchDashboard(activeDash);
+        store.fetchSalaries(activeSal);
+        store.fetchAttendanceRequests();
+        store.fetchPermissions();
+      }, 180);
+
+      setTimeout(() => {
+        store.fetchAttendanceAuditLogs();
+        store.fetchOvertimeStats();
+        store.fetchOvertimeRecords();
+        store.fetchPenalties();
+        store.fetchEmployees();
+        store.fetchPayrollPreflightCheck();
+        store.fetchDisbursementHistory();
+        store.fetchDatabaseStatus();
+      }, 240);
     } else {
-      const activeSal = store.activeSalaryFilter || "Monthly";
-      store.fetchMySalary(activeSal);
-      store.fetchPermissions();
-      store.fetchAttendanceRequests();
+      setTimeout(() => {
+        const activeSal = store.activeSalaryFilter || "Monthly";
+        store.fetchMySalary(activeSal);
+        store.fetchPermissions();
+        store.fetchAttendanceRequests();
+      }, 180);
     }
   }, []);
 

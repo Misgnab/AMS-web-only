@@ -23,6 +23,44 @@ export interface User {
   device_status?: string | null;
   salary_calculation_mode?: "GROSS" | "NET";
   department?: string;
+  status?: "ACTIVE" | "SUSPENDED";
+}
+
+export interface Workspace {
+  id: number;
+  name: string;
+  created_by?: number | null;
+  created_at?: string;
+  status?: "ACTIVE" | "INACTIVE";
+  description?: string;
+  employee_count?: number;
+  admin_count?: number;
+}
+
+export interface AuditLog {
+  id: number;
+  workspace_id?: number | null;
+  workspace_name?: string;
+  user_id?: number | null;
+  actor_name?: string;
+  actor_role?: string;
+  action: string;
+  details: string;
+  target_id?: number | null;
+  target_type?: string | null;
+  outcome?: "SUCCESS" | "FAILED" | "DENIED";
+  ip_address?: string;
+  created_at: string;
+}
+
+export interface SuperAdminStats {
+  totalWorkspaces: number;
+  totalAdmins: number;
+  totalEmployees: number;
+  todayCheckins: number;
+  pendingRequests: number;
+  pendingCorrections: number;
+  securityAlertsCount: number;
 }
 
 export interface SiteSettings {

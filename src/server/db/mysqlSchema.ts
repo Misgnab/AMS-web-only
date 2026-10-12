@@ -26,6 +26,8 @@ export const MYSQL_CREATE_TABLE_QUERIES: Record<string, string> = {
       id INT AUTO_INCREMENT PRIMARY KEY,
       name VARCHAR(191) NOT NULL UNIQUE,
       created_by INT DEFAULT NULL,
+      status VARCHAR(50) DEFAULT 'ACTIVE',
+      description TEXT,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
   `,
@@ -58,6 +60,7 @@ export const MYSQL_CREATE_TABLE_QUERIES: Record<string, string> = {
       device_status VARCHAR(50) DEFAULT 'APPROVED',
       salary_calculation_mode VARCHAR(50) DEFAULT 'GROSS',
       department VARCHAR(100) DEFAULT 'Operations',
+      status VARCHAR(50) DEFAULT 'ACTIVE',
       INDEX idx_users_phone (phone_number),
       INDEX idx_users_workspace (workspace_id),
       FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE SET NULL
@@ -476,11 +479,16 @@ export const MYSQL_CREATE_TABLE_QUERIES: Record<string, string> = {
       id INT AUTO_INCREMENT PRIMARY KEY,
       workspace_id INT,
       user_id INT,
+      actor_role VARCHAR(50),
       action VARCHAR(100) NOT NULL,
       details TEXT,
+      target_id INT,
+      target_type VARCHAR(100),
+      outcome VARCHAR(50) DEFAULT 'SUCCESS',
       ip_address VARCHAR(100),
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       INDEX idx_audit_logs_ws (workspace_id, created_at),
+      INDEX idx_audit_logs_action (action),
       FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE SET NULL
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
   `

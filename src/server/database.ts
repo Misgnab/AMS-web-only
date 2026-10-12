@@ -135,9 +135,18 @@ function ensureColumnMigrations() {
   addCol("users", "salary_calculation_mode", "VARCHAR(50) DEFAULT 'GROSS'");
   addCol("users", "department", "VARCHAR(100) DEFAULT 'Operations'");
   addCol("users", "created_by", "INT DEFAULT NULL");
+  addCol("users", "status", "VARCHAR(50) DEFAULT 'ACTIVE'");
 
   // workspaces columns
   addCol("workspaces", "created_by", "INT DEFAULT NULL");
+  addCol("workspaces", "status", "VARCHAR(50) DEFAULT 'ACTIVE'");
+  addCol("workspaces", "description", "TEXT");
+
+  // audit_logs columns
+  addCol("audit_logs", "actor_role", "VARCHAR(50)");
+  addCol("audit_logs", "target_id", "INT");
+  addCol("audit_logs", "target_type", "VARCHAR(100)");
+  addCol("audit_logs", "outcome", "VARCHAR(50) DEFAULT 'SUCCESS'");
 
   // site_settings columns
   addCol("site_settings", "default_salary_calculation", "VARCHAR(50) DEFAULT 'GROSS'");
@@ -153,17 +162,17 @@ function seedInitialData() {
     const wsCount = (db.prepare("SELECT COUNT(*) as c FROM workspaces").get() as any)?.c || 0;
     if (wsCount === 0) {
       console.log("Initializing primary workspace...");
-      db.prepare("INSERT INTO workspaces (id, name, created_by) VALUES (1, 'Main Office', NULL)").run();
+      db.prepare("INSERT INTO workspaces (id, name, created_by, status, description) VALUES (1, 'Main Office', NULL, 'ACTIVE', 'Primary Headquarters')").run();
     }
 
-    // 2. Ensure default Administrator (0911223344 / admin123) is provisioned
-    const existingDemoAdmin: any = db.prepare("SELECT id FROM users WHERE phone_number = ?").get("0911223344");
+    // 2. Ensure default Super Administrator (0911223344 / admin123) is provisioned
+    const existingDemoAdmin: any = db.prepare("SELECT id, role FROM users WHERE phone_number = ?").get("0911223344");
     if (!existingDemoAdmin) {
-      console.log("Provisioning default Administrator account (0911223344 / admin123)...");
+      console.log("Provisioning default Super Administrator account (0911223344 / admin123)...");
       const passwordHash = bcrypt.hashSync("admin123", 10);
       const res = db.prepare(`
-        INSERT INTO users (full_name, phone_number, role, password, hourly_rate, workspace_id)
-        VALUES ('System Administrator', '0911223344', 'AdminCreator', ?, 150.00, 1)
+        INSERT INTO users (full_name, phone_number, role, password, hourly_rate, workspace_id, status)
+        VALUES ('System Administrator', '0911223344', 'SuperAdmin', ?, 150.00, 1, 'ACTIVE')
       `).run(passwordHash);
       const seededId = Number(res.lastInsertRowid);
       db.prepare("UPDATE workspaces SET created_by = ? WHERE id = 1 AND (created_by IS NULL OR created_by = 0)").run(seededId);
@@ -174,12 +183,13 @@ function seedInitialData() {
         `).run(seededId);
       } catch (_) {}
     } else {
-      // Migrate legacy 45.00 placeholder to standard rate
+      // Ensure root admin has SuperAdmin role and active status
       try {
+        db.prepare("UPDATE users SET role = 'SuperAdmin', status = 'ACTIVE' WHERE id = ?").run(existingDemoAdmin.id);
         db.prepare("UPDATE users SET hourly_rate = 150.00 WHERE id = ? AND hourly_rate = 45.00").run(existingDemoAdmin.id);
       } catch (_) {}
       try {
-        const firstAdmin: any = db.prepare("SELECT id FROM users WHERE role IN ('Bootstrap', 'AdminCreator', 'SuperAdmin') ORDER BY id ASC LIMIT 1").get();
+        const firstAdmin: any = db.prepare("SELECT id FROM users WHERE role = 'SuperAdmin' ORDER BY id ASC LIMIT 1").get();
         if (firstAdmin?.id) {
           db.prepare("UPDATE workspaces SET created_by = ? WHERE id = 1 AND (created_by IS NULL OR created_by = 0)").run(firstAdmin.id);
         }

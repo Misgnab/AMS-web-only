@@ -603,31 +603,39 @@ export default function App() {
       fetchProfile().then((isValid) => {
         if (!isValid) return;
 
+        // Stage 1: Core operational data
         fetchTodayAttendance();
-        fetchAttendanceHistory();
-        fetchPermissions();
-        fetchAttendanceRequests();
-        fetchScores();
-        fetchQRCode();
-        fetchSiteSettings();
-        fetchMissingCheckouts();
-        fetchAttendanceCorrections();
         fetchAttendanceStatus();
-        fetchWorkCalendarStatus();
+        fetchSiteSettings();
         fetchWorkCalendar();
         fetchHolidays();
 
-        const currentUser = useAppStore.getState().user;
-        const adminRoles = ["SuperAdmin", "AdminCreator", "AdminManager", "Bootstrap", "HR"];
-        if (currentUser?.role && adminRoles.includes(currentUser.role)) {
-          fetchEmployees();
-          fetchDashboard(dashboardFilter);
-          fetchSalaries(salaryFilter);
-          fetchAttendanceAuditLogs();
-          fetchOvertimeStats();
-          fetchOvertimeRecords();
-          fetchPenalties();
-        }
+        // Stage 2: QR & Attendance history
+        setTimeout(() => {
+          fetchAttendanceHistory();
+          fetchPermissions();
+          fetchAttendanceRequests();
+          fetchScores();
+          fetchQRCode();
+          fetchMissingCheckouts();
+          fetchAttendanceCorrections();
+          fetchWorkCalendarStatus();
+        }, 80);
+
+        // Stage 3: Management dashboards and reports
+        setTimeout(() => {
+          const currentUser = useAppStore.getState().user;
+          const adminRoles = ["SuperAdmin", "AdminCreator", "AdminManager", "Bootstrap", "HR"];
+          if (currentUser?.role && adminRoles.includes(currentUser.role)) {
+            fetchEmployees();
+            fetchDashboard(dashboardFilter);
+            fetchSalaries(salaryFilter);
+            fetchAttendanceAuditLogs();
+            fetchOvertimeStats();
+            fetchOvertimeRecords();
+            fetchPenalties();
+          }
+        }, 160);
       });
     }
   }, [token]);

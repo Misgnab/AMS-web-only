@@ -236,11 +236,12 @@ const getStoredUser = (): User | null => {
   }
 };
 
-// Helper for authenticated API calls with automatic 401 session expiration handling
+// Helper for authenticated API calls with automatic retry and 401 session expiration handling
 const authenticatedFetch = async (
   url: string,
   options: RequestInit = {},
-  onUnauthorized?: () => void
+  onUnauthorized?: () => void,
+  retries = 2
 ): Promise<Response> => {
   const token = getStoredToken();
   const headers = new Headers(options.headers || {});
@@ -248,23 +249,41 @@ const authenticatedFetch = async (
     headers.set("Authorization", `Bearer ${token}`);
   }
 
-  try {
-    const res = await fetch(url, { ...options, headers });
-    if (res.status === 401) {
-      console.warn(`401 Unauthorized on ${url}. Session expired or invalid.`);
-      try {
-        localStorage.removeItem("attendance_token");
-        localStorage.removeItem("attendance_user");
-      } catch {}
-      if (onUnauthorized) {
-        onUnauthorized();
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(url, { ...options, headers });
+      if (res.status === 401) {
+        console.warn(`401 Unauthorized on ${url}. Session expired or invalid.`);
+        try {
+          localStorage.removeItem("attendance_token");
+          localStorage.removeItem("attendance_user");
+        } catch {}
+        if (onUnauthorized) {
+          onUnauthorized();
+        }
       }
+      return res;
+    } catch (err: any) {
+      const isNetworkError = err?.name === "TypeError" || /NetworkError|Failed to fetch|Load failed/i.test(err?.message || "");
+      if (attempt < retries && isNetworkError) {
+        await new Promise((r) => setTimeout(r, 250 * (attempt + 1)));
+        continue;
+      }
+      console.warn(`[Network] Fetch notice on ${url}:`, err?.message || err);
+      // Return a safe degraded Response so the caller receives a valid Response with ok: false
+      return new Response(JSON.stringify({ success: false, error: "Network unavailable", degraded: true }), {
+        status: 503,
+        statusText: "Service Unavailable",
+        headers: { "Content-Type": "application/json" }
+      });
     }
-    return res;
-  } catch (err: any) {
-    console.warn(`[Network] Fetch warning on ${url}:`, err?.message || err);
-    throw err;
   }
+
+  return new Response(JSON.stringify({ success: false, error: "Network unavailable" }), {
+    status: 503,
+    statusText: "Service Unavailable",
+    headers: { "Content-Type": "application/json" }
+  });
 };
 
 export const useAppStore = create<AppState>((set, get) => ({
@@ -564,7 +583,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         set({ employees: Array.isArray(data) ? data : [] });
       }
     } catch (err) {
-      console.error(err);
+      console.warn("fetchEmployees notice:", err);
     }
   },
 
@@ -938,7 +957,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         set({ salaries: Array.isArray(data) ? data : [] });
       }
     } catch (err) {
-      console.error("fetchSalaries error:", err);
+      console.warn("fetchSalaries notice:", err);
     }
   },
 
@@ -1083,7 +1102,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       }
       return [];
     } catch (err) {
-      console.error("fetchDisbursementHistory error:", err);
+      console.warn("fetchDisbursementHistory notice:", err);
       return [];
     }
   },
@@ -1145,7 +1164,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         set({ siteSettings: data });
       }
     } catch (err) {
-      console.error("Error fetching site settings:", err);
+      console.warn("Notice fetching site settings:", err);
     }
   },
 
@@ -1230,7 +1249,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       }
       return null;
     } catch (err) {
-      console.error("Error fetching attendance status:", err);
+      console.warn("Notice fetching attendance status:", err);
       return null;
     }
   },
@@ -1404,7 +1423,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       }
       return null;
     } catch (err) {
-      console.error("Error fetching payroll preflight check:", err);
+      console.warn("Notice fetching payroll preflight check:", err);
       return null;
     }
   },
@@ -1476,7 +1495,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         }
       }
     } catch (err) {
-      console.error("Error fetching holidays:", err);
+      console.warn("Notice fetching holidays:", err);
     }
   },
 
@@ -1556,7 +1575,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       }
       return null;
     } catch (err) {
-      console.error("Error fetching work calendar status:", err);
+      console.warn("Notice fetching work calendar status:", err);
       return null;
     }
   },
@@ -1576,7 +1595,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         }
       }
     } catch (err) {
-      console.error("Error fetching overtime records:", err);
+      console.warn("Notice fetching overtime records:", err);
     }
   },
 
@@ -1703,7 +1722,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         set({ penaltiesLoading: false });
       }
     } catch (err) {
-      console.error("Error fetching penalties:", err);
+      console.warn("Notice fetching penalties:", err);
       set({ penaltiesLoading: false });
     }
   },
