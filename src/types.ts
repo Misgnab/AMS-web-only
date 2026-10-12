@@ -756,6 +756,8 @@ export interface LatePenaltyRecord {
   employee_role?: string;
   phone_number?: string;
   hourly_rate?: number;
+  effective_hourly_rate?: number;
+  monthly_base_salary?: number;
   photo?: string | null;
   date: string;
   session: "Morning" | "Afternoon";
@@ -797,4 +799,6 @@ export interface LatePenaltyPolicy {
   late_penalty_fixed_amount: number;
   late_penalty_hourly_multiplier: number;
   punctuality_bonus_amount: number;
+  morning_start_time?: string;
+  afternoon_start_time?: string;
 }

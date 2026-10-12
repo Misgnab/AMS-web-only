@@ -183,6 +183,7 @@ interface AppState {
   updatePenaltyStatus: (id: number, status: string, reason?: string) => Promise<{ success: boolean; message?: string; error?: string }>;
   updatePenaltyNotification: (id: number, notification_status: "ACTIVE" | "UNCHECKED") => Promise<{ success: boolean; message?: string; error?: string }>;
   bulkUpdatePenaltyStatus: (ids: number[], status: string) => Promise<{ success: boolean; message?: string; error?: string }>;
+  recalculatePenalties: () => Promise<{ success: boolean; message?: string; updatedCount?: number; error?: string }>;
 }
 
 // Universal safe JSON parser for fetch responses
@@ -1851,6 +1852,25 @@ export const useAppStore = create<AppState>((set, get) => ({
         return { success: true, message: data.message };
       }
       return { success: false, error: data?.error || "Failed to bulk update penalties" };
+    } catch (err: any) {
+      return { success: false, error: err.message || "Network error" };
+    }
+  },
+
+  recalculatePenalties: async () => {
+    const { token } = get();
+    if (!token) return { success: false, error: "Not authenticated" };
+    try {
+      const res = await authenticatedFetch("/api/penalties/recalculate", {
+        method: "POST"
+      }, () => get().logout());
+      const data = await safeJson(res);
+      if (res.ok && data.success) {
+        get().fetchPenalties();
+        get().fetchSalaries(get().activeSalaryFilter || "Monthly");
+        return { success: true, message: data.message, updatedCount: data.updatedCount };
+      }
+      return { success: false, error: data?.error || "Failed to recalculate penalties" };
     } catch (err: any) {
       return { success: false, error: err.message || "Network error" };
     }

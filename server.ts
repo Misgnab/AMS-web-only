@@ -844,8 +844,8 @@ app.post("/api/employees/register", authenticateToken, (req: AuthenticatedReques
     return res.status(400).json({ success: false, error: "Access denied. Write operations forbidden." });
   }
 
-  const { full_name, phone_number, role, password, photo, hourly_rate, workspace_name } = req.body;
-  console.log("Registering employee:", { full_name, phone_number, role, hourly_rate });
+  const { full_name, phone_number, role, password, photo, hourly_rate, monthly_base_salary, workspace_name } = req.body;
+  console.log("Registering employee:", { full_name, phone_number, role, hourly_rate, monthly_base_salary });
 
   if (!full_name || !phone_number || !role || !password) {
     return res.status(400).json({ error: "Full name, phone number, role, and password are required" });
@@ -877,7 +877,8 @@ app.post("/api/employees/register", authenticateToken, (req: AuthenticatedReques
     }
 
     const passwordHash = bcrypt.hashSync(password, 10);
-    const rateValue = parseFloat(hourly_rate) || 15.0;
+    const rateValue = parseFloat(hourly_rate) > 0 ? parseFloat(hourly_rate) : 150.0;
+    const monthlySalary = parseFloat(monthly_base_salary) > 0 ? parseFloat(monthly_base_salary) : 0.0;
 
     let targetWorkspaceId: number | null = null;
 
@@ -924,9 +925,9 @@ app.post("/api/employees/register", authenticateToken, (req: AuthenticatedReques
     }
 
     const result = db.prepare(`
-      INSERT INTO users (full_name, phone_number, role, password, photo, hourly_rate, workspace_id, created_by)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(full_name, phone_number, role, passwordHash, photo || null, rateValue, targetWorkspaceId, req.user?.id || null);
+      INSERT INTO users (full_name, phone_number, role, password, photo, hourly_rate, monthly_base_salary, workspace_id, created_by)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(full_name, phone_number, role, passwordHash, photo || null, rateValue, monthlySalary, targetWorkspaceId, req.user?.id || null);
 
     const userId = Number(result.lastInsertRowid);
 
@@ -951,6 +952,7 @@ app.post("/api/employees/register", authenticateToken, (req: AuthenticatedReques
         phone_number,
         role,
         hourly_rate: rateValue,
+        monthly_base_salary: monthlySalary,
         workspace_id: targetWorkspaceId
       },
     };
@@ -978,7 +980,7 @@ app.get("/api/employees", authenticateToken, (req: AuthenticatedRequest, res: Re
   const currentRole = req.user?.role;
   const currentWorkspaceId = req.user?.workspace_id;
 
-  const adminRoles = ["SuperAdmin", "AdminCreator", "AdminManager", "Bootstrap"];
+  const adminRoles = ["SuperAdmin", "AdminCreator", "AdminManager", "Bootstrap", "HR", "Accountant"];
   if (!adminRoles.includes(currentRole || "")) {
     return res.status(403).json({ error: "Access denied." });
   }
@@ -3232,7 +3234,9 @@ app.get("/api/penalties", authenticateToken, (req: AuthenticatedRequest, res: Re
         allowed_minor_lates: siteSettings.allowed_minor_lates ?? 2,
         late_penalty_fixed_amount: siteSettings.late_penalty_fixed_amount ?? 25.0,
         late_penalty_hourly_multiplier: siteSettings.late_penalty_hourly_multiplier ?? 0.5,
-        punctuality_bonus_amount: siteSettings.punctuality_bonus_amount ?? 500.0
+        punctuality_bonus_amount: siteSettings.punctuality_bonus_amount ?? 500.0,
+        morning_start_time: siteSettings.morning_start_time || siteSettings.work_start_time || "08:30",
+        afternoon_start_time: siteSettings.afternoon_start_time || "13:30"
       }
     });
   } catch (error) {
@@ -3477,6 +3481,56 @@ app.put("/api/penalties/settings", authenticateToken, (req: AuthenticatedRequest
   } catch (error) {
     console.error("Update penalty settings error:", error);
     res.status(500).json({ error: "Failed to update penalty settings" });
+  }
+});
+
+// Recalculate unpaid late penalties dynamically based on employees' current hourly rates & settings
+app.post("/api/penalties/recalculate", authenticateToken, (req: AuthenticatedRequest, res: Response) => {
+  const role = req.user?.role || "";
+  const isManager = ["AdminCreator", "AdminManager", "SuperAdmin", "HR", "Bootstrap"].includes(role);
+  if (!isManager) {
+    return res.status(403).json({ error: "Access denied. Only Administrators and HR can recalculate penalties." });
+  }
+
+  const workspaceId = req.user?.workspace_id || 1;
+  try {
+    const siteSettings = AttendanceService.getSiteSettings(workspaceId);
+    const fixedPenalty = siteSettings.late_penalty_fixed_amount ?? 25.0;
+    const hourlyMultiplier = siteSettings.late_penalty_hourly_multiplier ?? 0.5;
+
+    const unsettled: any[] = db.prepare(`
+      SELECT lp.id, lp.attendance_id, lp.late_minutes, lp.penalty_type, u.hourly_rate, u.monthly_base_salary
+      FROM late_penalties lp
+      JOIN users u ON lp.user_id = u.id
+      WHERE lp.workspace_id = ?
+        AND (lp.penalty_status = 'PENALIZED' OR lp.penalty_status IS NULL)
+        AND lp.paid_at IS NULL
+        AND lp.payroll_id IS NULL
+        AND (lp.penalty_type != 'MANUAL_PENALTY' OR lp.penalty_type IS NULL)
+    `).all(workspaceId);
+
+    let updatedCount = 0;
+    for (const p of unsettled) {
+      const empRate = AttendanceService.getEmployeeEffectiveHourlyRate(p);
+      const newAmt = AttendanceService.calculateLatePenaltyAmount(p.late_minutes, empRate, fixedPenalty, hourlyMultiplier);
+      db.prepare("UPDATE late_penalties SET penalty_amount = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(newAmt, p.id);
+      if (p.attendance_id) {
+        db.prepare("UPDATE attendance SET penalty_amount = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(newAmt, p.attendance_id);
+      }
+      updatedCount++;
+    }
+
+    broadcastServerEvent("ATTENDANCE_CHANGED", { workspaceId, reason: "penalties_recalculated" }, workspaceId);
+    broadcastServerEvent("SALARY_CHANGED", { workspaceId, reason: "penalties_recalculated" }, workspaceId);
+
+    res.json({
+      success: true,
+      message: `Successfully recalculated ${updatedCount} late penalties using employees' current hourly rates and policy rules.`,
+      updatedCount
+    });
+  } catch (err: any) {
+    console.error("Recalculate penalties error:", err);
+    res.status(500).json({ error: "Failed to recalculate penalties" });
   }
 });
 

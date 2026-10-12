@@ -74,12 +74,14 @@ export const LatePenaltyManagement: React.FC<LatePenaltyManagementProps> = ({
     penaltyPolicy,
     penaltiesLoading,
     fetchPenalties,
+    fetchEmployees,
     waivePenalty,
     reinstatePenalty,
     updatePenaltyPolicy,
     addManualPenalty,
     updatePenaltyStatus,
-    updatePenaltyNotification
+    updatePenaltyNotification,
+    recalculatePenalties
   } = useAppStore();
 
   const isManager = ["AdminCreator", "AdminManager", "SuperAdmin", "HR", "Bootstrap"].includes(user?.role || "");
@@ -110,11 +112,12 @@ export const LatePenaltyManagement: React.FC<LatePenaltyManagementProps> = ({
   const [manualUserId, setManualUserId] = useState<number | "">("");
   const [manualDate, setManualDate] = useState<string>(getEthiopianDateString());
   const [manualSession, setManualSession] = useState<"Morning" | "Afternoon">("Morning");
-  const [manualCheckIn, setManualCheckIn] = useState<string>("02:35:00");
-  const [manualLateMinutes, setManualLateMinutes] = useState<number>(35);
-  const [manualPenaltyAmount, setManualPenaltyAmount] = useState<number>(35);
+  const [manualCheckIn, setManualCheckIn] = useState<string>("02:45:00");
+  const [manualLateMinutes, setManualLateMinutes] = useState<number>(15);
+  const [manualPenaltyAmount, setManualPenaltyAmount] = useState<number>(25);
   const [manualReason, setManualReason] = useState<string>("");
   const [manualLoading, setManualLoading] = useState<boolean>(false);
+  const [recalculating, setRecalculating] = useState<boolean>(false);
 
   // Policy Settings State
   const [showPolicyModal, setShowPolicyModal] = useState<boolean>(false);
@@ -133,6 +136,7 @@ export const LatePenaltyManagement: React.FC<LatePenaltyManagementProps> = ({
 
   useEffect(() => {
     fetchPenalties();
+    fetchEmployees();
   }, []);
 
   useEffect(() => {
@@ -144,27 +148,62 @@ export const LatePenaltyManagement: React.FC<LatePenaltyManagementProps> = ({
     }
   }, [penaltyPolicy]);
 
+  // Selected employee in manual modal
+  const selectedEmp = useMemo(() => {
+    if (!manualUserId) return null;
+    return employees.find((e) => e.id === Number(manualUserId)) || null;
+  }, [manualUserId, employees]);
+
+  const selectedEmpRate = useMemo(() => {
+    if (!selectedEmp) return 150;
+    return (selectedEmp as any)?.effective_hourly_rate
+      || (selectedEmp?.monthly_base_salary && selectedEmp.monthly_base_salary > 0 
+          ? Number((selectedEmp.monthly_base_salary / 208).toFixed(2)) 
+          : selectedEmp?.hourly_rate)
+      || 150;
+  }, [selectedEmp]);
+
   // Recalculate manual penalty when employee or minutes change
   useEffect(() => {
     if (manualUserId && manualLateMinutes) {
-      const emp = employees.find((e) => e.id === Number(manualUserId));
-      const hrRate = emp?.hourly_rate || 45;
+      const hrRate = selectedEmpRate;
       const fixed = parseFloat(fixedPenalty) || 25;
       const mult = parseFloat(hourlyMultiplier) || 0.5;
       const calculated = Math.round((fixed + (manualLateMinutes / 60) * hrRate * mult) * 100) / 100;
       setManualPenaltyAmount(calculated);
     }
-  }, [manualUserId, manualLateMinutes, fixedPenalty, hourlyMultiplier, employees]);
+  }, [manualUserId, manualLateMinutes, fixedPenalty, hourlyMultiplier, selectedEmpRate]);
 
   const showNotification = (type: "success" | "error", text: string) => {
     setActionMessage({ type, text });
     setTimeout(() => setActionMessage(null), 4500);
   };
 
+  // Recalculate unsettled penalties using current employee rates
+  const handleRecalculatePenalties = async () => {
+    setRecalculating(true);
+    const res = await recalculatePenalties();
+    setRecalculating(false);
+    if (res.success) {
+      showNotification("success", res.message || "Penalties recalculated successfully!");
+    } else {
+      showNotification("error", res.error || "Failed to recalculate penalties.");
+    }
+  };
+
+  // Dynamic scheduled start time based on policy or settings
+  const getSessionScheduledStart = (session: "Morning" | "Afternoon"): string => {
+    const rawSetting = session === "Morning"
+      ? (penaltyPolicy?.morning_start_time || "08:30")
+      : (penaltyPolicy?.afternoon_start_time || "13:30");
+    const eth = formatToEthiopianTime(rawSetting);
+    return `${String(eth.ethHour).padStart(2, "0")}:${eth.minute}:00`;
+  };
+
   // Auto calculate late minutes when check-in time changes in manual modal
   const handleManualCheckInChange = (val: string) => {
     setManualCheckIn(val);
-    const scheduledStart = manualSession === "Morning" ? "02:00:00" : "07:00:00";
+    const scheduledStart = getSessionScheduledStart(manualSession);
     let [chH, chM] = val.split(":").map(Number);
     const [stH, stM] = scheduledStart.split(":").map(Number);
     if (!isNaN(chH) && !isNaN(chM)) {
@@ -188,9 +227,15 @@ export const LatePenaltyManagement: React.FC<LatePenaltyManagementProps> = ({
 
   const handleManualSessionChange = (session: "Morning" | "Afternoon") => {
     setManualSession(session);
-    const defaultTime = session === "Morning" ? "02:35:00" : "07:35:00";
+    const startStr = getSessionScheduledStart(session);
+    const [stH, stM] = startStr.split(":").map(Number);
+    const lateMins = 20;
+    const totalMins = (stH * 60 + stM) + lateMins;
+    const lateH = Math.floor(totalMins / 60) % 24;
+    const lateM = totalMins % 60;
+    const defaultTime = `${String(lateH).padStart(2, "0")}:${String(lateM).padStart(2, "0")}:00`;
     setManualCheckIn(defaultTime);
-    setManualLateMinutes(35);
+    setManualLateMinutes(lateMins);
   };
 
   // Open Waive Modal
@@ -579,14 +624,26 @@ export const LatePenaltyManagement: React.FC<LatePenaltyManagementProps> = ({
           )}
 
           {isManager && activeView === "records" && (
-            <button
-              type="button"
-              onClick={() => setShowManualModal(true)}
-              className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-bold transition flex items-center gap-1.5 shadow-xs"
-            >
-              <PlusCircle size={14} />
-              <span className="whitespace-nowrap">Manual Entry</span>
-            </button>
+            <>
+              <button
+                type="button"
+                onClick={handleRecalculatePenalties}
+                disabled={recalculating}
+                className="px-3 py-1.5 bg-purple-50 hover:bg-purple-100 border border-purple-200 text-purple-700 rounded-xl text-xs font-bold transition flex items-center gap-1.5 shadow-2xs"
+                title="Recalculate unsettled penalties using current employee rates & site policy"
+              >
+                <RefreshCw size={13} className={recalculating ? "animate-spin" : ""} />
+                <span className="whitespace-nowrap hidden sm:inline">Sync & Recalculate</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowManualModal(true)}
+                className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-bold transition flex items-center gap-1.5 shadow-xs"
+              >
+                <PlusCircle size={14} />
+                <span className="whitespace-nowrap">Manual Entry</span>
+              </button>
+            </>
           )}
 
           <button
@@ -947,7 +1004,9 @@ export const LatePenaltyManagement: React.FC<LatePenaltyManagementProps> = ({
                               </div>
                             </div>
                             <div className="text-right">
-                              <div className="text-[10px] text-slate-400 font-medium">Deduction</div>
+                              <div className="text-[10px] text-slate-400 font-medium">
+                                {r.hourly_rate ? `Fine (@ ${r.hourly_rate.toFixed(0)} ETB/h)` : "Deduction"}
+                              </div>
                               <div
                                 className={`font-mono font-black text-sm ${
                                   isWaived ? "text-gray-400 line-through" : isGrace ? "text-slate-500" : "text-rose-600"
@@ -1222,9 +1281,14 @@ export const LatePenaltyManagement: React.FC<LatePenaltyManagementProps> = ({
                                     </div>
                                     <div>
                                       <div className="font-bold text-slate-900">{r.employee_name}</div>
-                                      <div className="text-[11px] text-gray-400 flex items-center gap-1.5">
+                                      <div className="text-[11px] text-gray-400 flex items-center gap-1.5 flex-wrap">
                                         <span>{r.employee_role || "Staff"}</span>
                                         {r.phone_number && <span>· {r.phone_number}</span>}
+                                        {r.hourly_rate && (
+                                          <span className="font-mono text-purple-700 font-bold bg-purple-50 px-1 rounded text-[10px]">
+                                            ETB {r.hourly_rate.toFixed(2)}/hr
+                                          </span>
+                                        )}
                                       </div>
                                     </div>
                                   </div>
@@ -1269,7 +1333,7 @@ export const LatePenaltyManagement: React.FC<LatePenaltyManagementProps> = ({
                                     ETB {r.penalty_amount.toFixed(2)}
                                   </div>
                                   <div className="text-[10px] text-gray-400">
-                                    {isWaived ? "Pardoned" : isGrace ? "Within Grace (0 ETB)" : "Payroll fine"}
+                                    {isWaived ? "Pardoned" : isGrace ? "Within Grace (0 ETB)" : r.hourly_rate ? `@ ETB ${r.hourly_rate.toFixed(2)}/hr` : "Payroll fine"}
                                   </div>
                                 </td>
 
@@ -1997,6 +2061,32 @@ export const LatePenaltyManagement: React.FC<LatePenaltyManagementProps> = ({
                       </option>
                     ))}
                   </select>
+
+                  {selectedEmp && (
+                    <div className="mt-2.5 p-3 bg-purple-50/80 border border-purple-200 rounded-xl space-y-1 text-xs">
+                      <div className="flex justify-between items-center text-purple-950 font-bold">
+                        <span>Staff Base Compensation:</span>
+                        <span className="font-mono text-purple-700 bg-white px-2 py-0.5 rounded-lg border border-purple-200 font-bold">
+                          ETB {selectedEmpRate.toFixed(2)}/hr
+                        </span>
+                      </div>
+                      {selectedEmp.monthly_base_salary && selectedEmp.monthly_base_salary > 0 ? (
+                        <p className="text-[11px] text-purple-700">
+                          Derived from monthly base salary: <strong>ETB {selectedEmp.monthly_base_salary.toLocaleString()}</strong> (÷ 208 hrs/mo per Labour Proclamation).
+                        </p>
+                      ) : (
+                        <p className="text-[11px] text-purple-700">
+                          Hourly pay rate registered in employee profile.
+                        </p>
+                      )}
+                      <div className="pt-1.5 border-t border-purple-200 flex justify-between items-center font-mono text-[11px] text-purple-900">
+                        <span>Formula Breakdown:</span>
+                        <span className="font-bold">
+                          ETB {fixedPenalty} + ({manualLateMinutes}m ÷ 60 × ETB {selectedEmpRate.toFixed(2)} × {hourlyMultiplier}x) = ETB {manualPenaltyAmount.toFixed(2)}
+                        </span>
+                      </div>
+                    </div>
+                  )}
                 </div>
 
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -2024,8 +2114,8 @@ export const LatePenaltyManagement: React.FC<LatePenaltyManagementProps> = ({
                       onChange={(e) => handleManualSessionChange(e.target.value as any)}
                       className="w-full p-2 border border-gray-200 rounded-xl bg-white focus:outline-none focus:border-blue-600"
                     >
-                      <option value="Morning">Morning Shift (02:00 - 06:00)</option>
-                      <option value="Afternoon">Afternoon Shift (07:00 - 11:00)</option>
+                      <option value="Morning">Morning Shift ({getSessionScheduledStart("Morning")})</option>
+                      <option value="Afternoon">Afternoon Shift ({getSessionScheduledStart("Afternoon")})</option>
                     </select>
                   </div>
                 </div>
@@ -2168,8 +2258,27 @@ export const LatePenaltyManagement: React.FC<LatePenaltyManagementProps> = ({
                 <span className="font-bold text-slate-800">{detailRecord.penalty_status}</span>
               </div>
               <div className="pt-2 flex justify-between">
+                <span className="text-gray-500">Employee Hourly Rate:</span>
+                <span className="font-mono font-bold text-purple-700 text-right">
+                  ETB {(detailRecord.effective_hourly_rate || detailRecord.hourly_rate || 150).toFixed(2)}/hr
+                  {detailRecord.monthly_base_salary && detailRecord.monthly_base_salary > 0 ? (
+                    <span className="text-[10px] text-gray-400 block font-normal">
+                      (Derived from ETB {detailRecord.monthly_base_salary.toLocaleString()}/mo)
+                    </span>
+                  ) : null}
+                </span>
+              </div>
+              <div className="pt-2 flex justify-between">
                 <span className="text-gray-500">Penalty Amount:</span>
                 <span className="font-mono font-black text-rose-600">ETB {detailRecord.penalty_amount.toFixed(2)}</span>
+              </div>
+              <div className="mt-2 p-2.5 bg-slate-50 border border-slate-200/60 rounded-xl text-[11px] text-slate-600 space-y-1">
+                <div className="font-semibold text-slate-700 flex items-center justify-between flex-wrap gap-1">
+                  <span>Policy Formula:</span>
+                  <span className="font-mono text-purple-700 font-bold text-[10px]">
+                    ETB {penaltyPolicy?.late_penalty_fixed_amount ?? 25} + ({detailRecord.late_minutes}m ÷ 60 × ETB {(detailRecord.effective_hourly_rate || detailRecord.hourly_rate || 150).toFixed(2)} × {penaltyPolicy?.late_penalty_hourly_multiplier ?? 0.5}x)
+                  </span>
+                </div>
               </div>
               {detailRecord.verification_method && (
                 <div className="pt-2 flex justify-between items-center">

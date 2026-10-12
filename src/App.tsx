@@ -519,7 +519,7 @@ export default function App() {
   const [regName, setRegName] = useState("");
   const [regPhone, setRegPhone] = useState("");
   const [regPass, setRegPass] = useState("");
-  const [regRate, setRegRate] = useState("25.00");
+  const [regRate, setRegRate] = useState("150.00");
   const [regRole, setRegRole] = useState<string>("Employee");
   const [regSuccessMsg, setRegSuccessMsg] = useState("");
   const [regErrorMsg, setRegErrorMsg] = useState("");

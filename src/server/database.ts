@@ -2,6 +2,7 @@ import crypto from "crypto";
 import bcrypt from "bcryptjs";
 import { db, databaseManager } from "./db/databaseManager.ts";
 import { AttendanceService } from "./attendanceService.ts";
+import { formatToEthiopianTime } from "../utils/ethiopianTime.ts";
 export { db, databaseManager };
 
 export function initDatabase() {
@@ -284,10 +285,15 @@ export function syncDatabaseOvertimeAndPenalties() {
       const hourlyMult = ss.late_penalty_hourly_multiplier ?? 0.5;
       const graceMins = ss.late_grace_minutes ?? 15;
 
+      const scheduledStartStr = a.session === "Morning" 
+        ? (ss.morning_start_time || ss.work_start_time || "08:30") 
+        : (ss.afternoon_start_time || "13:30");
+      const scheduledStartEth = formatToEthiopianTime(scheduledStartStr);
+      const scheduledStart = `${String(scheduledStartEth.ethHour).padStart(2, "0")}:${scheduledStartEth.minute}:00`;
+
       let effectiveStatus = a.penalty_status;
       let lateMins = a.late_minutes || 0;
       if (!lateMins && a.check_in_time) {
-        const scheduledStart = a.session === "Morning" ? "02:00:00" : "07:00:00";
         let [chH, chM] = a.check_in_time.split(":").map(Number);
         const [stH, stM] = scheduledStart.split(":").map(Number);
         if (!isNaN(chH) && !isNaN(chM)) {
@@ -330,7 +336,6 @@ export function syncDatabaseOvertimeAndPenalties() {
       // Ensure corresponding row exists in late_penalties table
       const existingPenalty: any = db.prepare("SELECT id FROM late_penalties WHERE attendance_id = ?").get(a.id);
       if (!existingPenalty) {
-        const scheduledStart = a.session === "Morning" ? "02:00:00" : "07:00:00";
         db.prepare(`
           INSERT INTO late_penalties (
             attendance_id, user_id, workspace_id, date, session, check_in_time, check_out_time,
