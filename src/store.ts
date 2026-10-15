@@ -28,7 +28,10 @@ import {
   PayrollPreFlightResult,
   LatePenaltyRecord,
   LatePenaltyStats,
-  LatePenaltyPolicy
+  LatePenaltyPolicy,
+  Workspace,
+  AuditLog,
+  SuperAdminStats
 } from "./types.js";
 
 interface AppState {
@@ -67,6 +70,12 @@ interface AppState {
   databaseError: string | null;
   loading: boolean;
   error: string | null;
+  workspaces: Workspace[];
+  currentWorkspaceId: number | "all" | null;
+  superAdminStats: SuperAdminStats | null;
+  adminUsers: any[];
+  auditLogs: AuditLog[];
+  auditLogsLoading: boolean;
 
   // Actions
   setupDatabaseConnection: (config: MysqlFormConfig) => Promise<{ success: boolean; error?: string; message?: string }>;
@@ -184,6 +193,23 @@ interface AppState {
   updatePenaltyNotification: (id: number, notification_status: "ACTIVE" | "UNCHECKED") => Promise<{ success: boolean; message?: string; error?: string }>;
   bulkUpdatePenaltyStatus: (ids: number[], status: string) => Promise<{ success: boolean; message?: string; error?: string }>;
   recalculatePenalties: () => Promise<{ success: boolean; message?: string; updatedCount?: number; error?: string }>;
+
+  // SuperAdmin & Multi-Workspace Actions
+  fetchWorkspaces: () => Promise<Workspace[]>;
+  createWorkspace: (data: Partial<Workspace> & { office_name?: string; latitude?: number; longitude?: number; wifi_ssid?: string; wifi_ip?: string }) => Promise<{ success: boolean; error?: string; workspace?: Workspace }>;
+  updateWorkspace: (id: number, data: Partial<Workspace>) => Promise<{ success: boolean; error?: string }>;
+  deactivateWorkspace: (id: number) => Promise<{ success: boolean; error?: string }>;
+  setCurrentWorkspaceId: (wsId: number | "all" | null) => void;
+  fetchSuperAdminStats: () => Promise<SuperAdminStats | null>;
+  fetchAdminUsers: () => Promise<any[]>;
+  createAdminUser: (data: any) => Promise<{ success: boolean; error?: string; id?: number }>;
+  updateAdminUser: (id: number, data: any) => Promise<{ success: boolean; error?: string }>;
+  toggleAdminStatus: (id: number, status: "ACTIVE" | "SUSPENDED", reason?: string) => Promise<{ success: boolean; error?: string }>;
+  assignAdminWorkspace: (adminId: number, workspaceId: number) => Promise<{ success: boolean; error?: string }>;
+  fetchAdminWorkspaces: (adminId: number) => Promise<number[]>;
+  updateAdminWorkspaces: (adminId: number, workspaceIds: number[], primaryWorkspaceId?: number) => Promise<{ success: boolean; error?: string }>;
+  fetchAuditLogs: (params?: { workspaceId?: number | "all"; action?: string; outcome?: string; search?: string; limit?: number }) => Promise<AuditLog[]>;
+  runSecurityTests: () => Promise<{ success: boolean; summary?: any; results?: any[]; error?: string }>;
 }
 
 // Universal safe JSON parser for fetch responses
@@ -324,6 +350,12 @@ export const useAppStore = create<AppState>((set, get) => ({
   databaseError: null,
   loading: false,
   error: null,
+  workspaces: [],
+  currentWorkspaceId: null,
+  superAdminStats: null,
+  adminUsers: [],
+  auditLogs: [],
+  auditLogsLoading: false,
 
   setToken: (token) => {
     try {
@@ -491,12 +523,33 @@ export const useAppStore = create<AppState>((set, get) => ({
       employees: [],
       todayAttendance: [],
       attendanceHistory: [],
+      missingCheckouts: [],
+      attendanceCorrections: [],
+      attendanceAuditLogs: [],
+      payrollPreflight: null,
+      attendanceStatus: null,
       permissions: [],
       attendanceRequests: [],
       salaries: [],
+      mySalary: null,
+      disbursements: [],
       scores: [],
       qrCode: null,
       dashboardData: null,
+      siteSettings: null,
+      workSchedules: [],
+      holidays: [],
+      overtimeRecords: [],
+      overtimeStats: null,
+      effectiveWorkStatus: null,
+      latePenalties: [],
+      penaltyStats: null,
+      penaltyPolicy: null,
+      workspaces: [],
+      currentWorkspaceId: null,
+      superAdminStats: null,
+      adminUsers: [],
+      auditLogs: [],
       error: null
     });
   },
@@ -1990,6 +2043,311 @@ export const useAppStore = create<AppState>((set, get) => ({
       document.body.removeChild(a);
     } catch (err: any) {
       console.error("Export SQL error:", err);
+    }
+  },
+
+  fetchWorkspaces: async () => {
+    const { token } = get();
+    if (!token) return [];
+    try {
+      const res = await authenticatedFetch("/api/workspaces", {}, () => get().logout());
+      if (res.ok) {
+        const data = await safeJson(res);
+        const list = Array.isArray(data) ? data : [];
+        set({ workspaces: list });
+        return list;
+      }
+      return [];
+    } catch (err) {
+      console.error("fetchWorkspaces error:", err);
+      return [];
+    }
+  },
+
+  createWorkspace: async (data) => {
+    const { token } = get();
+    if (!token) return { success: false, error: "Not authenticated" };
+    try {
+      const res = await authenticatedFetch("/api/workspaces", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(data)
+      }, () => get().logout());
+      const resData = await safeJson(res);
+      if (res.ok && resData.success) {
+        get().fetchWorkspaces();
+        get().fetchSuperAdminStats();
+        return { success: true, workspace: resData.workspace };
+      }
+      return { success: false, error: resData?.error || "Failed to create workspace" };
+    } catch (err: any) {
+      return { success: false, error: err.message || "Network error" };
+    }
+  },
+
+  updateWorkspace: async (id, data) => {
+    const { token } = get();
+    if (!token) return { success: false, error: "Not authenticated" };
+    try {
+      const res = await authenticatedFetch(`/api/workspaces/${id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(data)
+      }, () => get().logout());
+      const resData = await safeJson(res);
+      if (res.ok && resData.success) {
+        get().fetchWorkspaces();
+        return { success: true };
+      }
+      return { success: false, error: resData?.error || "Failed to update workspace" };
+    } catch (err: any) {
+      return { success: false, error: err.message || "Network error" };
+    }
+  },
+
+  deactivateWorkspace: async (id) => {
+    const { token } = get();
+    if (!token) return { success: false, error: "Not authenticated" };
+    try {
+      const res = await authenticatedFetch(`/api/workspaces/${id}`, {
+        method: "DELETE"
+      }, () => get().logout());
+      const resData = await safeJson(res);
+      if (res.ok && resData.success) {
+        get().fetchWorkspaces();
+        get().fetchSuperAdminStats();
+        return { success: true };
+      }
+      return { success: false, error: resData?.error || "Failed to deactivate workspace" };
+    } catch (err: any) {
+      return { success: false, error: err.message || "Network error" };
+    }
+  },
+
+  setCurrentWorkspaceId: (wsId) => {
+    set({ currentWorkspaceId: wsId });
+    const {
+      fetchEmployees,
+      fetchDashboard,
+      fetchSalaries,
+      fetchSiteSettings,
+      fetchTodayAttendance,
+      fetchAttendanceHistory,
+      fetchPenalties,
+      fetchOvertimeRecords,
+      fetchWorkCalendar,
+      fetchHolidays
+    } = get();
+    fetchEmployees();
+    fetchDashboard();
+    fetchSalaries();
+    fetchSiteSettings();
+    fetchTodayAttendance();
+    fetchAttendanceHistory();
+    fetchPenalties();
+    fetchOvertimeRecords();
+    fetchWorkCalendar();
+    fetchHolidays();
+  },
+
+  fetchSuperAdminStats: async () => {
+    const { token, user } = get();
+    if (!token || user?.role !== "SuperAdmin") return null;
+    try {
+      const res = await authenticatedFetch("/api/superadmin/stats", {}, () => get().logout());
+      if (res.ok) {
+        const data = await safeJson(res);
+        set({ superAdminStats: data });
+        return data;
+      }
+      return null;
+    } catch (err) {
+      console.error("fetchSuperAdminStats error:", err);
+      return null;
+    }
+  },
+
+  fetchAdminUsers: async () => {
+    const { token, user } = get();
+    if (!token || user?.role !== "SuperAdmin") return [];
+    try {
+      const res = await authenticatedFetch("/api/superadmin/admins", {}, () => get().logout());
+      if (res.ok) {
+        const data = await safeJson(res);
+        const list = Array.isArray(data) ? data : [];
+        set({ adminUsers: list });
+        return list;
+      }
+      return [];
+    } catch (err) {
+      console.error("fetchAdminUsers error:", err);
+      return [];
+    }
+  },
+
+  createAdminUser: async (data) => {
+    const { token } = get();
+    if (!token) return { success: false, error: "Not authenticated" };
+    try {
+      const res = await authenticatedFetch("/api/superadmin/admins", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(data)
+      }, () => get().logout());
+      const resData = await safeJson(res);
+      if (res.ok && resData.success) {
+        get().fetchAdminUsers();
+        get().fetchSuperAdminStats();
+        return { success: true, id: resData.id };
+      }
+      return { success: false, error: resData?.error || "Failed to create administrator" };
+    } catch (err: any) {
+      return { success: false, error: err.message || "Network error" };
+    }
+  },
+
+  updateAdminUser: async (id, data) => {
+    const { token } = get();
+    if (!token) return { success: false, error: "Not authenticated" };
+    try {
+      const res = await authenticatedFetch(`/api/superadmin/admins/${id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(data)
+      }, () => get().logout());
+      const resData = await safeJson(res);
+      if (res.ok && resData.success) {
+        get().fetchAdminUsers();
+        return { success: true };
+      }
+      return { success: false, error: resData?.error || "Failed to update administrator" };
+    } catch (err: any) {
+      return { success: false, error: err.message || "Network error" };
+    }
+  },
+
+  toggleAdminStatus: async (id, status, reason) => {
+    const { token } = get();
+    if (!token) return { success: false, error: "Not authenticated" };
+    try {
+      const res = await authenticatedFetch(`/api/superadmin/admins/${id}/status`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status, reason })
+      }, () => get().logout());
+      const resData = await safeJson(res);
+      if (res.ok && resData.success) {
+        get().fetchAdminUsers();
+        return { success: true };
+      }
+      return { success: false, error: resData?.error || "Failed to change admin status" };
+    } catch (err: any) {
+      return { success: false, error: err.message || "Network error" };
+    }
+  },
+
+  assignAdminWorkspace: async (adminId, workspaceId) => {
+    const { token } = get();
+    if (!token) return { success: false, error: "Not authenticated" };
+    try {
+      const res = await authenticatedFetch(`/api/superadmin/admins/${adminId}/assign-workspace`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ workspace_id: workspaceId })
+      }, () => get().logout());
+      const resData = await safeJson(res);
+      if (res.ok && resData.success) {
+        get().fetchAdminUsers();
+        get().fetchWorkspaces();
+        return { success: true };
+      }
+      return { success: false, error: resData?.error || "Failed to assign workspace" };
+    } catch (err: any) {
+      return { success: false, error: err.message || "Network error" };
+    }
+  },
+
+  fetchAdminWorkspaces: async (adminId) => {
+    const { token } = get();
+    if (!token) return [];
+    try {
+      const res = await authenticatedFetch(`/api/superadmin/admins/${adminId}/workspaces`, {}, () => get().logout());
+      if (res.ok) {
+        const data = await safeJson(res);
+        return Array.isArray(data.workspaceIds) ? data.workspaceIds : [];
+      }
+      return [];
+    } catch (err) {
+      console.error("fetchAdminWorkspaces error:", err);
+      return [];
+    }
+  },
+
+  updateAdminWorkspaces: async (adminId, workspaceIds, primaryWorkspaceId) => {
+    const { token } = get();
+    if (!token) return { success: false, error: "Not authenticated" };
+    try {
+      const res = await authenticatedFetch(`/api/superadmin/admins/${adminId}/workspaces`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ workspace_ids: workspaceIds, primary_workspace_id: primaryWorkspaceId })
+      }, () => get().logout());
+      const resData = await safeJson(res);
+      if (res.ok && resData.success) {
+        get().fetchAdminUsers();
+        return { success: true };
+      }
+      return { success: false, error: resData?.error || "Failed to update workspace assignments" };
+    } catch (err: any) {
+      return { success: false, error: err.message || "Network error" };
+    }
+  },
+
+  fetchAuditLogs: async (params = {}) => {
+    const { token } = get();
+    if (!token) return [];
+    try {
+      set({ auditLogsLoading: true });
+      const q = new URLSearchParams();
+      if (params.workspaceId && params.workspaceId !== "all") {
+        q.append("workspace_id", String(params.workspaceId));
+      }
+      if (params.action && params.action !== "ALL") q.append("action", params.action);
+      if (params.outcome && params.outcome !== "ALL") q.append("outcome", params.outcome);
+      if (params.search) q.append("search", params.search);
+      if (params.limit) q.append("limit", String(params.limit));
+
+      const res = await authenticatedFetch(`/api/audit-logs?${q.toString()}`, {}, () => get().logout());
+      if (res.ok) {
+        const data = await safeJson(res);
+        const list = Array.isArray(data) ? data : [];
+        set({ auditLogs: list, auditLogsLoading: false });
+        return list;
+      }
+      set({ auditLogsLoading: false });
+      return [];
+    } catch (err) {
+      console.error("fetchAuditLogs error:", err);
+      set({ auditLogsLoading: false });
+      return [];
+    }
+  },
+
+  runSecurityTests: async () => {
+    const { token } = get();
+    if (!token) return { success: false, error: "Not authenticated" };
+    try {
+      const res = await authenticatedFetch("/api/security/run-tests", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" }
+      }, () => get().logout());
+      const data = await safeJson(res);
+      if (res.ok) {
+        return { success: true, summary: data, results: data?.results || [] };
+      }
+      return { success: false, error: data?.error || "Security test execution failed" };
+    } catch (err: any) {
+      return { success: false, error: err.message || "Network error" };
     }
   }
 }));

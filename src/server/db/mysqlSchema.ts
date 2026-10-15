@@ -5,6 +5,7 @@
 export const DATABASE_TABLE_ORDER = [
   "workspaces",
   "users",
+  "workspace_assignments",
   "site_settings",
   "attendance_qr_codes",
   "work_schedules",
@@ -64,6 +65,21 @@ export const MYSQL_CREATE_TABLE_QUERIES: Record<string, string> = {
       INDEX idx_users_phone (phone_number),
       INDEX idx_users_workspace (workspace_id),
       FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE SET NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+  `,
+
+  workspace_assignments: `
+    CREATE TABLE IF NOT EXISTS workspace_assignments (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      user_id INT NOT NULL,
+      workspace_id INT NOT NULL,
+      assigned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      assigned_by INT DEFAULT NULL,
+      UNIQUE KEY uniq_user_workspace (user_id, workspace_id),
+      INDEX idx_ws_assign_user (user_id),
+      INDEX idx_ws_assign_ws (workspace_id),
+      FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
+      FOREIGN KEY (workspace_id) REFERENCES workspaces (id) ON DELETE CASCADE
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
   `,
 

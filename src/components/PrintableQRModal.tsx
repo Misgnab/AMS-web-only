@@ -43,8 +43,8 @@ export const PrintableQRModal: React.FC<PrintableQRModalProps> = ({
 
   if (!isOpen || !qrCode) return null;
 
-  const officeName = siteSettings?.office_name || workspaceName || "Apex Main Office";
-  const wifiSsid = siteSettings?.office_wifi_ssid || siteSettings?.wifi_ssid || "Apex_HQ_WiFi";
+  const officeName = siteSettings?.office_name || workspaceName || "Main Office";
+  const wifiSsid = siteSettings?.office_wifi_ssid || siteSettings?.wifi_ssid || "Office_WiFi";
   const qrId = qrCode.qr_id || qrCode.token_id || "OFFICE-QR-ACTIVE";
   const generatedDate = qrCode.created_at 
     ? new Date(qrCode.created_at).toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric" })

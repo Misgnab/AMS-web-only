@@ -39,6 +39,12 @@ import {
   ethiopianToGregorianDate,
   ethiopianToGregorianTime
 } from "./src/utils/ethiopianTime.ts";
+import {
+  parseTimeToEthiopianMinutes,
+  formatMinutesToEthiopianTimeStr,
+  detectActiveAttendanceSession,
+  getWorkspaceShiftWindows
+} from "./src/utils/sessionDetection.ts";
 import { logAuditEvent } from "./src/server/auditService.ts";
 import {
   hasPermission,
@@ -51,6 +57,8 @@ import {
   requireSuperAdmin,
   enforceWorkspaceScope
 } from "./src/server/rbac.ts";
+import { runAutomatedSecurityTests } from "./src/server/tests/securityTests.ts";
+import { runAttendanceSessionTests } from "./src/server/tests/sessionDetectionTests.ts";
 
 // Initialize the database and seed it
 initDatabase();
@@ -1414,6 +1422,9 @@ app.put("/api/employees/:id/hourly-rate", authenticateToken, (req: Authenticated
     if (currentRole !== "SuperAdmin" && currentRole !== "Bootstrap" && employee.workspace_id !== currentWorkspaceId) {
       return res.status(403).json({ error: "Access denied. Data isolation violation." });
     }
+    if (parseInt(id, 10) === req.user?.id && currentRole !== "SuperAdmin") {
+      return res.status(403).json({ error: "Access denied. Administrators cannot modify their own hourly rate." });
+    }
 
     db.prepare("UPDATE users SET hourly_rate = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(parseFloat(hourly_rate), id);
     broadcastServerEvent("SALARY_CHANGED", { userId: parseInt(id), hourly_rate: parseFloat(hourly_rate) }, employee.workspace_id || 1);
@@ -1879,6 +1890,79 @@ app.post("/api/superadmin/admins/:id/assign-workspace", authenticateToken, requi
   }
 });
 
+// Get all authorized workspaces for an administrator (SuperAdmin only)
+app.get("/api/superadmin/admins/:id/workspaces", authenticateToken, requireSuperAdmin, (req: AuthenticatedRequest, res: Response) => {
+  const adminId = parseInt(req.params.id, 10);
+  try {
+    const userRow: any = db.prepare("SELECT workspace_id FROM users WHERE id = ?").get(adminId);
+    if (!userRow) return res.status(404).json({ error: "Administrator not found" });
+
+    const primaryWsId = userRow.workspace_id;
+    const assignments = db.prepare("SELECT workspace_id FROM workspace_assignments WHERE user_id = ?").all(adminId) as any[];
+    const assignedIds = new Set<number>();
+    if (primaryWsId) assignedIds.add(Number(primaryWsId));
+    assignments.forEach(a => assignedIds.add(Number(a.workspace_id)));
+
+    res.json({
+      adminId,
+      primaryWorkspaceId: primaryWsId,
+      workspaceIds: Array.from(assignedIds)
+    });
+  } catch (err: any) {
+    console.error("Get admin workspaces error:", err);
+    res.status(500).json({ error: "Failed to fetch admin workspaces" });
+  }
+});
+
+// Update workspace assignments for an administrator (SuperAdmin only)
+app.post("/api/superadmin/admins/:id/workspaces", authenticateToken, requireSuperAdmin, (req: AuthenticatedRequest, res: Response) => {
+  const adminId = parseInt(req.params.id, 10);
+  const { workspace_ids, primary_workspace_id } = req.body;
+
+  if (!Array.isArray(workspace_ids)) {
+    return res.status(400).json({ error: "workspace_ids must be an array of workspace IDs" });
+  }
+
+  try {
+    const userRow: any = db.prepare("SELECT * FROM users WHERE id = ?").get(adminId);
+    if (!userRow) return res.status(404).json({ error: "Administrator not found" });
+
+    const primaryId = primary_workspace_id ? Number(primary_workspace_id) : (workspace_ids[0] ? Number(workspace_ids[0]) : userRow.workspace_id);
+
+    if (primaryId) {
+      db.prepare("UPDATE users SET workspace_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(primaryId, adminId);
+    }
+
+    db.prepare("DELETE FROM workspace_assignments WHERE user_id = ?").run(adminId);
+    const insertStmt = db.prepare("INSERT INTO workspace_assignments (user_id, workspace_id, assigned_by) VALUES (?, ?, ?)");
+    for (const wsId of workspace_ids) {
+      const numId = Number(wsId);
+      if (numId && !isNaN(numId)) {
+        try {
+          insertStmt.run(adminId, numId, req.user?.id);
+        } catch (_) {}
+      }
+    }
+
+    logAuditEvent({
+      workspaceId: primaryId || 1,
+      userId: req.user?.id,
+      actorRole: req.user?.role,
+      action: "ADMIN_WORKSPACES_UPDATED",
+      details: `Updated workspace assignments for ${userRow.full_name} (#${adminId}): [${workspace_ids.join(", ")}], primary: #${primaryId}`,
+      targetId: adminId,
+      targetType: "user",
+      outcome: "SUCCESS",
+      ipAddress: req.ip || "127.0.0.1"
+    });
+
+    res.json({ success: true, workspaceIds: workspace_ids, primaryWorkspaceId: primaryId });
+  } catch (err: any) {
+    console.error("Update admin workspaces error:", err);
+    res.status(500).json({ error: "Failed to update admin workspace assignments" });
+  }
+});
+
 // Comprehensive Audit Logs Endpoint (SuperAdmin sees all/filtered; Workspace Admin sees only authorized workspace)
 app.get("/api/audit-logs", authenticateToken, (req: AuthenticatedRequest, res: Response) => {
   const role = req.user?.role;
@@ -1937,6 +2021,29 @@ app.get("/api/audit-logs", authenticateToken, (req: AuthenticatedRequest, res: R
   } catch (err: any) {
     console.error("Fetch audit logs error:", err);
     res.status(500).json({ error: "Failed to fetch audit logs" });
+  }
+});
+
+// Run Automated RBAC and Workspace Isolation Security Test Suite (SuperAdmin only)
+app.post("/api/security/run-tests", authenticateToken, requireSuperAdmin, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const port = Number(process.env.PORT) || 3000;
+    const testReport = await runAutomatedSecurityTests(port);
+
+    logAuditEvent({
+      workspaceId: req.user?.workspace_id || 1,
+      userId: req.user?.id,
+      actorRole: req.user?.role,
+      action: "SECURITY_TEST_SUITE_EXECUTED",
+      details: `Executed automated security test suite: ${testReport.passed}/${testReport.total} tests passed (allPassed: ${testReport.allPassed})`,
+      outcome: testReport.allPassed ? "SUCCESS" : "FAILED",
+      ipAddress: req.ip || "127.0.0.1"
+    });
+
+    res.json(testReport);
+  } catch (err: any) {
+    console.error("Run security tests error:", err);
+    res.status(500).json({ error: "Failed to execute security tests: " + (err?.message || "Internal error") });
   }
 });
 
@@ -3268,7 +3375,7 @@ app.delete("/api/holidays/:id", authenticateToken, (req: AuthenticatedRequest, r
 
 // Check Effective Work Status for any date & time
 app.get("/api/work-calendar/status", authenticateToken, (req: AuthenticatedRequest, res: Response) => {
-  const workspaceId = req.user?.workspace_id || 1;
+  const workspaceId = getAuthorizedWorkspaceId(req, req.query.workspace_id);
   let dateStr = (req.query.date as string) || getEthiopianDateString();
   let timeStr = (req.query.time as string) || getEthiopianTimeString();
   const session = (req.query.session as string) || undefined;
@@ -3343,7 +3450,7 @@ app.get("/api/work-calendar/status", authenticateToken, (req: AuthenticatedReque
 
 // Get Overtime Records (with employee names and filters)
 app.get("/api/overtime", authenticateToken, (req: AuthenticatedRequest, res: Response) => {
-  const workspaceId = req.user?.workspace_id || 1;
+  const workspaceId = getAuthorizedWorkspaceId(req, req.query.workspace_id);
   const role = req.user?.role || "";
   const isManager = ["AdminCreator", "AdminManager", "SuperAdmin", "HR"].includes(role);
 
@@ -3390,7 +3497,7 @@ app.get("/api/overtime", authenticateToken, (req: AuthenticatedRequest, res: Res
 
 // Get Overtime Dashboard Stats
 app.get("/api/overtime/stats", authenticateToken, (req: AuthenticatedRequest, res: Response) => {
-  const workspaceId = req.user?.workspace_id || 1;
+  const workspaceId = getAuthorizedWorkspaceId(req, req.query.workspace_id);
   const todayStr = getEthiopianDateString();
 
   try {
@@ -3756,7 +3863,7 @@ app.delete("/api/overtime/:id", authenticateToken, (req: AuthenticatedRequest, r
 
 // 1. Get Penalties & Late Records from Database
 app.get("/api/penalties", authenticateToken, (req: AuthenticatedRequest, res: Response) => {
-  const workspaceId = req.user?.workspace_id || 1;
+  const workspaceId = getAuthorizedWorkspaceId(req, req.query.workspace_id);
   const role = req.user?.role || "";
   const isManager = ["AdminCreator", "AdminManager", "SuperAdmin", "HR", "Bootstrap"].includes(role);
 
@@ -4650,6 +4757,17 @@ app.all("/api/work-calendar/run-tests", (req: Request, res: Response) => {
   }
 });
 
+// Run 14 Comprehensive Attendance Session Detection Validation Test Cases
+app.all("/api/attendance/session-tests", (req: Request, res: Response) => {
+  try {
+    const testResults = runAttendanceSessionTests();
+    res.json(testResults);
+  } catch (error) {
+    console.error("Run session detection tests error:", error);
+    res.status(500).json({ error: "Failed to execute attendance session validation tests" });
+  }
+});
+
 // Check-In (Enterprise Attendance Verification Engine)
 app.post("/api/attendance/check-in", authenticateToken, (req: AuthenticatedRequest, res: Response) => {
   if (req.user?.role === "Bootstrap") {
@@ -4675,35 +4793,49 @@ app.post("/api/attendance/check-in", authenticateToken, (req: AuthenticatedReque
   const complianceRoles = ["Employee", "Purchaser", "Accountant", "Engineer", "HR", "AdminCreator", "AdminManager"];
 
   try {
-    const createdWs: any = db.prepare("SELECT id FROM workspaces WHERE created_by = ? ORDER BY id ASC LIMIT 1").get(req.user?.id);
-    let workspaceId = createdWs ? createdWs.id : req.user?.workspace_id;
+    const userRow: any = db.prepare("SELECT workspace_id, created_by FROM users WHERE id = ?").get(req.user?.id);
+    let workspaceId = userRow?.workspace_id || req.user?.workspace_id;
+    if (!workspaceId && userRow?.created_by) {
+      const creatorRow: any = db.prepare("SELECT workspace_id FROM users WHERE id = ?").get(userRow.created_by);
+      workspaceId = creatorRow?.workspace_id;
+    }
     if (!workspaceId) {
-      const userRow: any = db.prepare("SELECT workspace_id, created_by FROM users WHERE id = ?").get(req.user?.id);
-      if (userRow?.workspace_id) {
-        workspaceId = userRow.workspace_id;
-      } else if (userRow?.created_by) {
-        const creatorRow: any = db.prepare("SELECT workspace_id FROM users WHERE id = ?").get(userRow.created_by);
-        workspaceId = creatorRow?.workspace_id || 1;
-      } else {
-        workspaceId = 1;
-      }
+      const createdWs: any = db.prepare("SELECT id FROM workspaces WHERE created_by = ? ORDER BY id ASC LIMIT 1").get(req.user?.id);
+      workspaceId = createdWs?.id || 1;
     }
 
     const siteSettings = AttendanceService.getSiteSettings(workspaceId);
-
-    const settingTimeToEthMins = (timeStr?: string, defaultMins: number = 0): number => {
-      if (!timeStr) return defaultMins;
-      const parts = timeStr.trim().split(":");
-      const h = parseInt(parts[0], 10);
-      const m = parseInt(parts[1] || "0", 10);
-      if (isNaN(h)) return defaultMins;
-      const ethH = (h >= 6 && h <= 23) ? ((h - 6 + 24) % 24) : h;
-      return ethH * 60 + m;
-    };
-
+    const sessionDetection = detectActiveAttendanceSession(nowTimeStr, siteSettings);
+    const activeSession = sessionDetection.activeSession;
     const nowTotalMins = (nowH || 0) * 60 + (nowM || 0);
-    const afternoonStartEthMins = settingTimeToEthMins(siteSettings.afternoon_start_time, 450);
-    const activeSession = nowTotalMins < afternoonStartEthMins ? "Morning" : "Afternoon";
+
+    // Reject check-in immediately if no attendance session is currently active
+    if (!activeSession) {
+      return res.status(400).json({
+        error: `No attendance session is currently active. ${sessionDetection.message}`,
+        code: "OUTSIDE_ATTENDANCE_SESSION",
+        current_time: nowTimeStr,
+        session_status: sessionDetection.status,
+        next_session: sessionDetection.nextSession,
+        next_session_opens_at: sessionDetection.nextSessionOpensAt,
+        shift_windows: sessionDetection.shiftWindows
+      });
+    }
+
+    if (session && session !== activeSession) {
+      const targetWin = sessionDetection.shiftWindows;
+      const activeWindowStr = activeSession === "Morning" 
+        ? `${targetWin.morningStartStr} – ${targetWin.morningEndStr}` 
+        : `${targetWin.afternoonStartStr} – ${targetWin.afternoonEndStr}`;
+      return res.status(400).json({
+        error: `Current time (${nowTimeStr}) is for the ${activeSession} session (${activeWindowStr}). You cannot check in for the ${session} session.`,
+        code: "SESSION_MISMATCH",
+        active_session: activeSession,
+        requested_session: session,
+        current_time: nowTimeStr,
+        shift_windows: sessionDetection.shiftWindows
+      });
+    }
 
     // STEP 0: DEVICE BINDING & ANTI-BUDDY PUNCHING VALIDATION
     const currentUser: any = db.prepare(`
@@ -4894,12 +5026,6 @@ app.post("/api/attendance/check-in", authenticateToken, (req: AuthenticatedReque
       }
     }
 
-    if (session && session !== activeSession) {
-      return res.status(400).json({
-        error: `Current time (${nowTimeStr}) is for the ${activeSession} session. You cannot check in for the ${session} session.`
-      });
-    }
-
     // Prevent check-in if user is on approved leave / permission for this session or full day
     const approvedLeaves: any[] = db.prepare(`
       SELECT p.request_type, p.session 
@@ -5030,12 +5156,12 @@ app.post("/api/attendance/check-in", authenticateToken, (req: AuthenticatedReque
 
     // 1. Enforce Earliest Allowed Check-in Time (Both Morning & Afternoon Sessions)
     const earliestCheckinStr = activeSession === "Morning"
-      ? (siteSettings.morning_earliest_checkin_time || siteSettings.earliest_checkin_time || "07:00")
-      : (siteSettings.afternoon_earliest_checkin_time || "12:30");
+      ? (siteSettings.morning_earliest_checkin_time || siteSettings.earliest_checkin_time || "01:00")
+      : (siteSettings.afternoon_earliest_checkin_time || "06:30");
 
     if (earliestCheckinStr) {
-      const earliestEthMins = settingTimeToEthMins(earliestCheckinStr);
-      if (nowTotalMins < earliestEthMins) {
+      const earliestEthMins = parseTimeToEthiopianMinutes(earliestCheckinStr, activeSession === "Morning" ? "MorningCheckin" : "AfternoonCheckin");
+      if (earliestEthMins !== null && nowTotalMins < earliestEthMins) {
         return res.status(400).json({
           error: `Check-in restriction: Early check-in for ${activeSession} session is not permitted before ${earliestCheckinStr}. Company policy restricts check-in prior to this window.`,
           code: "EARLIEST_CHECKIN_RESTRICTION",
@@ -5047,12 +5173,12 @@ app.post("/api/attendance/check-in", authenticateToken, (req: AuthenticatedReque
 
     // 2. Enforce Latest Allowed Check-in Cutoff (Both Morning & Afternoon Sessions)
     const latestCheckinStr = activeSession === "Morning"
-      ? (siteSettings.morning_latest_checkin_time || siteSettings.latest_checkin_time || "10:30")
-      : (siteSettings.afternoon_latest_checkin_time || "15:30");
+      ? (siteSettings.morning_latest_checkin_time || siteSettings.latest_checkin_time || "04:30")
+      : (siteSettings.afternoon_latest_checkin_time || "09:30");
 
     if (latestCheckinStr) {
-      const latestEthMins = settingTimeToEthMins(latestCheckinStr);
-      if (nowTotalMins > latestEthMins) {
+      const latestEthMins = parseTimeToEthiopianMinutes(latestCheckinStr, activeSession === "Morning" ? "MorningCheckin" : "AfternoonCheckin");
+      if (latestEthMins !== null && nowTotalMins > latestEthMins) {
         return res.status(400).json({
           error: `Check-in restriction: ${activeSession} session check-in window closed at ${latestCheckinStr}. Company policy restricts check-ins after this cutoff time.`,
           code: "LATEST_CHECKIN_RESTRICTION",
@@ -5064,9 +5190,9 @@ app.post("/api/attendance/check-in", authenticateToken, (req: AuthenticatedReque
 
     // 3. Scheduled session start & lateness evaluation
     const scheduledStartStr = activeSession === "Morning" 
-      ? (siteSettings.morning_start_time || siteSettings.work_start_time || "08:30") 
-      : (siteSettings.afternoon_start_time || "13:30");
-    const scheduledStartEthMins = settingTimeToEthMins(scheduledStartStr);
+      ? (siteSettings.morning_start_time || siteSettings.work_start_time || "02:00") 
+      : (siteSettings.afternoon_start_time || "07:00");
+    const scheduledStartEthMins = parseTimeToEthiopianMinutes(scheduledStartStr, activeSession === "Morning" ? "MorningStart" : "AfternoonStart") ?? (activeSession === "Morning" ? 120 : 420);
     const sessionGraceMins = activeSession === "Morning"
       ? (siteSettings.morning_late_grace_minutes ?? siteSettings.late_grace_minutes ?? 15)
       : (siteSettings.afternoon_late_grace_minutes ?? siteSettings.late_grace_minutes ?? 15);
@@ -5217,18 +5343,15 @@ app.post("/api/attendance/check-out", authenticateToken, (req: AuthenticatedRequ
   const complianceRoles = ["Employee", "Purchaser", "Accountant", "Engineer", "HR", "AdminCreator", "AdminManager"];
 
   try {
-    const createdWsOut: any = db.prepare("SELECT id FROM workspaces WHERE created_by = ? ORDER BY id ASC LIMIT 1").get(req.user?.id);
-    let workspaceId = createdWsOut ? createdWsOut.id : req.user?.workspace_id;
+    const userRowOut: any = db.prepare("SELECT workspace_id, created_by FROM users WHERE id = ?").get(req.user?.id);
+    let workspaceId = userRowOut?.workspace_id || req.user?.workspace_id;
+    if (!workspaceId && userRowOut?.created_by) {
+      const creatorRow: any = db.prepare("SELECT workspace_id FROM users WHERE id = ?").get(userRowOut.created_by);
+      workspaceId = creatorRow?.workspace_id;
+    }
     if (!workspaceId) {
-      const userRow: any = db.prepare("SELECT workspace_id, created_by FROM users WHERE id = ?").get(req.user?.id);
-      if (userRow?.workspace_id) {
-        workspaceId = userRow.workspace_id;
-      } else if (userRow?.created_by) {
-        const creatorRow: any = db.prepare("SELECT workspace_id FROM users WHERE id = ?").get(userRow.created_by);
-        workspaceId = creatorRow?.workspace_id || 1;
-      } else {
-        workspaceId = 1;
-      }
+      const createdWsOut: any = db.prepare("SELECT id FROM workspaces WHERE created_by = ? ORDER BY id ASC LIMIT 1").get(req.user?.id);
+      workspaceId = createdWsOut?.id || 1;
     }
 
     // STEP 0: DEVICE BINDING VALIDATION FOR CHECK-OUT
@@ -5295,36 +5418,26 @@ app.post("/api/attendance/check-out", authenticateToken, (req: AuthenticatedRequ
 
     const siteSettings = AttendanceService.getSiteSettings(workspaceId);
 
-    const settingTimeToEthMins = (timeStr?: string, defaultMins: number = 0): number => {
-      if (!timeStr) return defaultMins;
-      const parts = timeStr.trim().split(":");
-      const h = parseInt(parts[0], 10);
-      const m = parseInt(parts[1] || "0", 10);
-      if (isNaN(h)) return defaultMins;
-      const ethH = (h >= 6 && h <= 23) ? ((h - 6 + 24) % 24) : h;
-      return ethH * 60 + m;
-    };
-
-    const morningEndEthMins = settingTimeToEthMins(siteSettings.morning_end_time || "12:30", 390);
+    const morningEndEthMins = parseTimeToEthiopianMinutes(siteSettings.morning_end_time, "MorningEnd") ?? 360;
     const morningGrace = siteSettings.morning_checkout_grace_minutes ?? siteSettings.checkout_grace_minutes ?? 30;
     const morningCheckoutCutoff = siteSettings.morning_latest_checkout_time
-      ? settingTimeToEthMins(siteSettings.morning_latest_checkout_time, 450)
-      : morningEndEthMins + morningGrace;
+      ? (parseTimeToEthiopianMinutes(siteSettings.morning_latest_checkout_time, "MorningCheckout") ?? (morningEndEthMins + morningGrace))
+      : (morningEndEthMins + morningGrace);
 
-    const afternoonEndEthMins = settingTimeToEthMins(siteSettings.afternoon_end_time || siteSettings.work_end_time || "17:30", 690);
+    const afternoonEndEthMins = parseTimeToEthiopianMinutes(siteSettings.afternoon_end_time || siteSettings.work_end_time, "AfternoonEnd") ?? 660;
     const afternoonGrace = siteSettings.afternoon_checkout_grace_minutes ?? siteSettings.checkout_grace_minutes ?? 30;
     const afternoonCheckoutCutoff = (siteSettings.afternoon_latest_checkout_time || siteSettings.latest_checkout_time)
-      ? settingTimeToEthMins(siteSettings.afternoon_latest_checkout_time || siteSettings.latest_checkout_time, 720)
-      : afternoonEndEthMins + afternoonGrace;
+      ? (parseTimeToEthiopianMinutes(siteSettings.afternoon_latest_checkout_time || siteSettings.latest_checkout_time, "AfternoonCheckout") ?? (afternoonEndEthMins + afternoonGrace))
+      : (afternoonEndEthMins + afternoonGrace);
 
     // Enforce earliest allowed checkout for the active record session:
     const earliestCheckoutStr = record.session === "Morning"
-      ? (siteSettings.morning_earliest_checkout_time || "11:30")
-      : (siteSettings.afternoon_earliest_checkout_time || siteSettings.earliest_checkout_time || "16:30");
+      ? (siteSettings.morning_earliest_checkout_time || "05:30")
+      : (siteSettings.afternoon_earliest_checkout_time || siteSettings.earliest_checkout_time || "10:30");
 
     if (earliestCheckoutStr) {
-      const earliestCheckoutEthMins = settingTimeToEthMins(earliestCheckoutStr);
-      if (nowTotalMins < earliestCheckoutEthMins) {
+      const earliestCheckoutEthMins = parseTimeToEthiopianMinutes(earliestCheckoutStr, record.session === "Morning" ? "MorningCheckout" : "AfternoonCheckout");
+      if (earliestCheckoutEthMins !== null && nowTotalMins < earliestCheckoutEthMins) {
         return res.status(400).json({
           error: `Checkout restriction: Early checkout for ${record.session} session is not permitted before ${earliestCheckoutStr}. Company policy restricts checkout prior to this window.`,
           code: "EARLIEST_CHECKOUT_RESTRICTION",
@@ -5465,7 +5578,7 @@ app.post("/api/attendance/check-out", authenticateToken, (req: AuthenticatedRequ
     const requireApproval = (siteSettings.require_overtime_approval ?? 1) === 1;
     const overtimeStatus = hasOvertime ? (requireApproval ? "PENDING" : "APPROVED") : null;
 
-    const sessionStartMins = settingTimeToEthMins(sessionStartStr);
+    const sessionStartMins = parseTimeToEthiopianMinutes(sessionStartStr, record.session === "Morning" ? "MorningStart" : "AfternoonStart") ?? (record.session === "Morning" ? 120 : 420);
     const isLateCheckin = AttendanceService.evaluateLateness(
       record.session, 
       checkInTime, 
@@ -5649,18 +5762,48 @@ app.get("/api/attendance/status", authenticateToken, (req: AuthenticatedRequest,
   const userId = req.user?.id;
   const [nowH, nowM] = nowTimeStr.split(":").map(Number);
   const nowTotalMins = (nowH || 0) * 60 + (nowM || 0);
-  const activeSession = nowTotalMins < 390 ? "Morning" : "Afternoon";
+
+  const userWs: any = db.prepare("SELECT workspace_id, created_by FROM users WHERE id = ?").get(userId);
+  let workspaceId = userWs?.workspace_id || req.user?.workspace_id;
+  if (!workspaceId && userWs?.created_by) {
+    const creatorRow: any = db.prepare("SELECT workspace_id FROM users WHERE id = ?").get(userWs.created_by);
+    workspaceId = creatorRow?.workspace_id;
+  }
+  if (!workspaceId) {
+    workspaceId = 1;
+  }
+  const siteSettings = AttendanceService.getSiteSettings(workspaceId);
+  const sessionDetection = detectActiveAttendanceSession(nowTimeStr, siteSettings);
+  const activeSession = sessionDetection.activeSession;
 
   try {
     // 0. Run automated shift exception evaluation
-    AttendanceService.evaluateAttendanceExceptionsAndShifts(req.user?.workspace_id || 1, todayStr, nowTimeStr);
+    AttendanceService.evaluateAttendanceExceptionsAndShifts(workspaceId, todayStr, nowTimeStr);
 
-    // 1. Check open record today for current active session
-    const openToday: any = db.prepare(`
-      SELECT * FROM attendance 
-      WHERE user_id = ? AND date = ? AND session = ? AND check_out_time IS NULL
-      LIMIT 1
-    `).get(userId, todayStr, activeSession);
+    // 1. Check open record today for current active session, or any unclosed session today
+    const openToday: any = activeSession 
+      ? db.prepare(`
+          SELECT * FROM attendance 
+          WHERE user_id = ? AND date = ? AND session = ? AND check_out_time IS NULL
+          LIMIT 1
+        `).get(userId, todayStr, activeSession)
+      : db.prepare(`
+          SELECT * FROM attendance 
+          WHERE user_id = ? AND date = ? AND check_out_time IS NULL
+          ORDER BY check_in_time DESC LIMIT 1
+        `).get(userId, todayStr);
+
+    // Check if user has already attended/completed this active session today
+    const attendedCurrentSession: any = activeSession 
+      ? db.prepare(`
+          SELECT * FROM attendance 
+          WHERE user_id = ? AND date = ? AND session = ?
+          LIMIT 1
+        `).get(userId, todayStr, activeSession)
+      : null;
+
+    const morningCutoffMins = sessionDetection.shiftWindows.morningEndMins + (siteSettings.morning_checkout_grace_minutes ?? siteSettings.checkout_grace_minutes ?? 30);
+    const afternoonCutoffMins = sessionDetection.shiftWindows.afternoonEndMins + (siteSettings.afternoon_checkout_grace_minutes ?? siteSettings.checkout_grace_minutes ?? 30);
 
     // 2. Check open/missing checkout from past days OR expired sessions today (Strict Morning & Afternoon rules)
     const pastMissing: any[] = db.prepare(`
@@ -5668,13 +5811,13 @@ app.get("/api/attendance/status", authenticateToken, (req: AuthenticatedRequest,
       WHERE user_id = ? 
         AND (
           (date < ? AND (check_out_time IS NULL OR status = 'Missing Checkout'))
-          OR (date = ? AND session = 'Morning' AND (? >= '06:30:00' OR ? >= 390) AND check_out_time IS NULL)
-          OR (date = ? AND session = 'Afternoon' AND (? >= '12:00:00' OR ? >= 720) AND check_out_time IS NULL)
+          OR (date = ? AND session = 'Morning' AND ? >= ? AND check_out_time IS NULL)
+          OR (date = ? AND session = 'Afternoon' AND ? >= ? AND check_out_time IS NULL)
           OR (status = 'Missing Checkout')
         )
         AND (correction_status != 'CORRECTED' OR correction_status IS NULL)
       ORDER BY date DESC, session ASC
-    `).all(userId, todayStr, todayStr, nowTimeStr, nowTotalMins, todayStr, nowTimeStr, nowTotalMins);
+    `).all(userId, todayStr, todayStr, nowTotalMins, morningCutoffMins, todayStr, nowTotalMins, afternoonCutoffMins);
 
     // Auto-flag any records that aren't marked yet
     for (const pm of pastMissing) {
@@ -5689,7 +5832,7 @@ app.get("/api/attendance/status", authenticateToken, (req: AuthenticatedRequest,
       }
     }
 
-    const canCheckIn = !openToday && pastMissing.length === 0;
+    const canCheckIn = !!activeSession && !openToday && !attendedCurrentSession && pastMissing.length === 0;
     const canCheckOut = !!openToday;
 
     res.json({
@@ -5698,6 +5841,12 @@ app.get("/api/attendance/status", authenticateToken, (req: AuthenticatedRequest,
       hasMissingCheckout: pastMissing.length > 0,
       missingRecords: pastMissing,
       activeSession,
+      sessionStatus: sessionDetection.status,
+      sessionMessage: sessionDetection.message,
+      nextSession: sessionDetection.nextSession,
+      nextSessionOpensAt: sessionDetection.nextSessionOpensAt,
+      shiftWindows: sessionDetection.shiftWindows,
+      attendedCurrentSession: !!attendedCurrentSession,
       canCheckIn,
       canCheckOut,
       todayDate: todayStr,
@@ -5724,6 +5873,11 @@ app.get("/api/attendance/missing-checkouts", authenticateToken, (req: Authentica
     // Run automated shift exception evaluation first
     AttendanceService.evaluateAttendanceExceptionsAndShifts(currentWorkspaceId || 1, todayStr, nowTimeStr);
 
+    const wsSettings = AttendanceService.getSiteSettings(currentWorkspaceId || 1);
+    const shiftWindows = getWorkspaceShiftWindows(wsSettings);
+    const morningCutoffMins = shiftWindows.morningEndMins + (wsSettings.morning_checkout_grace_minutes ?? wsSettings.checkout_grace_minutes ?? 30);
+    const afternoonCutoffMins = shiftWindows.afternoonEndMins + (wsSettings.afternoon_checkout_grace_minutes ?? wsSettings.checkout_grace_minutes ?? 30);
+
     let records: any[];
     if (currentRole === "SuperAdmin") {
       records = db.prepare(`
@@ -5736,12 +5890,12 @@ app.get("/api/attendance/missing-checkouts", authenticateToken, (req: Authentica
         WHERE (
           a.status = 'Missing Checkout' 
           OR (a.date < ? AND a.check_out_time IS NULL)
-          OR (a.date = ? AND a.session = 'Morning' AND (? >= '06:30:00' OR ? >= 390) AND a.check_out_time IS NULL)
-          OR (a.date = ? AND a.session = 'Afternoon' AND (? >= '12:00:00' OR ? >= 720) AND a.check_out_time IS NULL)
+          OR (a.date = ? AND a.session = 'Morning' AND ? >= ? AND a.check_out_time IS NULL)
+          OR (a.date = ? AND a.session = 'Afternoon' AND ? >= ? AND a.check_out_time IS NULL)
         )
         AND (a.correction_status != 'CORRECTED' OR a.correction_status IS NULL)
         ORDER BY a.date DESC, a.check_in_time DESC
-      `).all(todayStr, todayStr, nowTimeStr, nowTotalMins, todayStr, nowTimeStr, nowTotalMins);
+      `).all(todayStr, todayStr, nowTotalMins, morningCutoffMins, todayStr, nowTotalMins, afternoonCutoffMins);
     } else if (currentRole === "Bootstrap") {
       records = [];
     } else if (currentRole === "AdminCreator" || currentRole === "AdminManager" || currentRole === "HR") {
@@ -5757,12 +5911,12 @@ app.get("/api/attendance/missing-checkouts", authenticateToken, (req: Authentica
           AND (
             a.status = 'Missing Checkout' 
             OR (a.date < ? AND a.check_out_time IS NULL)
-            OR (a.date = ? AND a.session = 'Morning' AND (? >= '06:30:00' OR ? >= 390) AND a.check_out_time IS NULL)
-            OR (a.date = ? AND a.session = 'Afternoon' AND (? >= '12:00:00' OR ? >= 720) AND a.check_out_time IS NULL)
+            OR (a.date = ? AND a.session = 'Morning' AND ? >= ? AND a.check_out_time IS NULL)
+            OR (a.date = ? AND a.session = 'Afternoon' AND ? >= ? AND a.check_out_time IS NULL)
           )
           AND (a.correction_status != 'CORRECTED' OR a.correction_status IS NULL)
         ORDER BY a.date DESC, a.check_in_time DESC
-      `).all(...filterParams, todayStr, todayStr, nowTimeStr, nowTotalMins, todayStr, nowTimeStr, nowTotalMins);
+      `).all(...filterParams, todayStr, todayStr, nowTotalMins, morningCutoffMins, todayStr, nowTotalMins, afternoonCutoffMins);
     } else {
       records = db.prepare(`
         SELECT a.*, u.full_name, u.phone_number, u.role, u.hourly_rate, u.monthly_base_salary,
@@ -5775,12 +5929,12 @@ app.get("/api/attendance/missing-checkouts", authenticateToken, (req: Authentica
           AND (
             a.status = 'Missing Checkout' 
             OR (a.date < ? AND a.check_out_time IS NULL)
-            OR (a.date = ? AND a.session = 'Morning' AND (? >= '06:30:00' OR ? >= 390) AND a.check_out_time IS NULL)
-            OR (a.date = ? AND a.session = 'Afternoon' AND (? >= '12:00:00' OR ? >= 720) AND a.check_out_time IS NULL)
+            OR (a.date = ? AND a.session = 'Morning' AND ? >= ? AND a.check_out_time IS NULL)
+            OR (a.date = ? AND a.session = 'Afternoon' AND ? >= ? AND a.check_out_time IS NULL)
           )
           AND (a.correction_status != 'CORRECTED' OR a.correction_status IS NULL)
         ORDER BY a.date DESC, a.check_in_time DESC
-      `).all(req.user?.id, todayStr, todayStr, nowTimeStr, nowTotalMins, todayStr, nowTimeStr, nowTotalMins);
+      `).all(req.user?.id, todayStr, todayStr, nowTotalMins, morningCutoffMins, todayStr, nowTotalMins, afternoonCutoffMins);
     }
 
     res.json(records);
@@ -8052,13 +8206,25 @@ app.get("/api/salaries", authenticateToken, (req: AuthenticatedRequest, res: Res
     const params: any[] = [];
 
     if (currentRole === "SuperAdmin") {
-      usersQuery = `
-        SELECT u.*, w.name as workspace_name 
-        FROM users u 
-        LEFT JOIN workspaces w ON u.workspace_id = w.id
-        WHERE u.role IN ('Employee', 'Purchaser', 'Accountant', 'Engineer', 'HR')
-        ORDER BY u.full_name ASC
-      `;
+      const targetWs = req.query.workspace_id;
+      if (targetWs && targetWs !== "all" && Number(targetWs) > 0) {
+        usersQuery = `
+          SELECT u.*, w.name as workspace_name 
+          FROM users u 
+          LEFT JOIN workspaces w ON u.workspace_id = w.id
+          WHERE u.role IN ('Employee', 'Purchaser', 'Accountant', 'Engineer', 'HR') AND u.workspace_id = ?
+          ORDER BY u.full_name ASC
+        `;
+        params.push(Number(targetWs));
+      } else {
+        usersQuery = `
+          SELECT u.*, w.name as workspace_name 
+          FROM users u 
+          LEFT JOIN workspaces w ON u.workspace_id = w.id
+          WHERE u.role IN ('Employee', 'Purchaser', 'Accountant', 'Engineer', 'HR')
+          ORDER BY u.full_name ASC
+        `;
+      }
     } else if (currentRole === "Bootstrap") {
       usersQuery = `
         SELECT u.*, w.name as workspace_name 
@@ -8310,6 +8476,9 @@ app.put("/api/employees/:id/compensation", authenticateToken, (req: Authenticate
     if (currentRole !== "SuperAdmin" && currentRole !== "Bootstrap" && employee.workspace_id !== currentWorkspaceId) {
       return res.status(403).json({ error: "Access denied. Data isolation violation." });
     }
+    if (parseInt(id, 10) === req.user?.id && currentRole !== "SuperAdmin") {
+      return res.status(403).json({ error: "Access denied. Administrators cannot modify their own salary or compensation package." });
+    }
 
     const newHourly = hourly_rate !== undefined ? parseFloat(hourly_rate) : employee.hourly_rate;
     const newMonthly = monthly_base_salary !== undefined ? parseFloat(monthly_base_salary) : employee.monthly_base_salary;
@@ -8450,6 +8619,7 @@ app.post("/api/salaries/disburse", authenticateToken, (req: AuthenticatedRequest
       const user = db.prepare("SELECT * FROM users WHERE id = ?").get(uid) as any;
       if (!user) return;
       if (currentRole !== "SuperAdmin" && currentRole !== "Bootstrap" && user.workspace_id !== currentWorkspaceId) return;
+      if (uid === req.user?.id && currentRole !== "SuperAdmin") return; // Prevent administrators from approving or disbursing their own salary
 
       const calc = calculateEnterprisePayrollForUser(user, startStr, endStr, filterType);
 

@@ -1,6 +1,11 @@
 import { db } from "./database.ts";
 import { WorkCalendarService } from "./workCalendarService.ts";
 import { formatToEthiopianTime } from "../utils/ethiopianTime.ts";
+import {
+  parseTimeToEthiopianMinutes,
+  detectActiveAttendanceSession,
+  getWorkspaceShiftWindows
+} from "../utils/sessionDetection.ts";
 import type { AttendanceRecord, AttendanceCorrection, SiteSettings } from "../types.ts";
 
 export interface AttendanceExceptionItem {
@@ -243,13 +248,9 @@ export class AttendanceService {
       let baseStartMins = customStartMins;
       if (baseStartMins === undefined || baseStartMins === null) {
         const startStr = session === "Morning" 
-          ? (settings.morning_start_time || settings.work_start_time || "08:30") 
-          : (settings.afternoon_start_time || "13:30");
-        const parts = startStr.trim().split(":");
-        const sh = parseInt(parts[0], 10);
-        const sm = parseInt(parts[1] || "0", 10);
-        const ethH = (sh >= 6 && sh <= 23) ? ((sh - 6 + 24) % 24) : sh;
-        baseStartMins = ethH * 60 + sm;
+          ? (settings.morning_start_time || settings.work_start_time || "02:00") 
+          : (settings.afternoon_start_time || "07:00");
+        baseStartMins = parseTimeToEthiopianMinutes(startStr, session === "Morning" ? "MorningStart" : "AfternoonStart") ?? (session === "Morning" ? 120 : 420);
       }
       const graceCutoffMins = baseStartMins + effectiveGrace;
 
@@ -284,26 +285,16 @@ export class AttendanceService {
       const settings = this.getSiteSettings(workspaceId);
       const maxDurationHours = settings.max_shift_duration_hours || 14;
 
-      const parseSettingEthMins = (timeStr?: string, defaultMins: number = 0): number => {
-        if (!timeStr) return defaultMins;
-        const [hStr, mStr] = timeStr.trim().split(":");
-        const h = parseInt(hStr, 10);
-        const m = parseInt(mStr || "0", 10);
-        if (isNaN(h)) return defaultMins;
-        const ethH = (h >= 6 && h <= 23) ? ((h - 6 + 24) % 24) : h;
-        return ethH * 60 + m;
-      };
-
-      const morningEndEthMins = parseSettingEthMins(settings.morning_end_time, 390);
+      const morningEndEthMins = parseTimeToEthiopianMinutes(settings.morning_end_time, "MorningEnd") ?? 360;
       const morningGrace = settings.morning_checkout_grace_minutes ?? settings.checkout_grace_minutes ?? 30;
       const morningCutoffMins = settings.morning_latest_checkout_time
-        ? parseSettingEthMins(settings.morning_latest_checkout_time, 450)
+        ? (parseTimeToEthiopianMinutes(settings.morning_latest_checkout_time, "MorningCheckout") ?? (morningEndEthMins + morningGrace))
         : (morningEndEthMins + morningGrace);
 
-      const afternoonEndEthMins = parseSettingEthMins(settings.afternoon_end_time || settings.work_end_time, 690);
+      const afternoonEndEthMins = parseTimeToEthiopianMinutes(settings.afternoon_end_time || settings.work_end_time, "AfternoonEnd") ?? 660;
       const afternoonGrace = settings.afternoon_checkout_grace_minutes ?? settings.checkout_grace_minutes ?? 30;
       const afternoonCutoffMins = (settings.afternoon_latest_checkout_time || settings.latest_checkout_time)
-        ? parseSettingEthMins(settings.afternoon_latest_checkout_time || settings.latest_checkout_time, 720)
+        ? (parseTimeToEthiopianMinutes(settings.afternoon_latest_checkout_time || settings.latest_checkout_time, "AfternoonCheckout") ?? (afternoonEndEthMins + afternoonGrace))
         : (afternoonEndEthMins + afternoonGrace);
 
       // 1. Find all unclosed shifts from past dates (or today where elapsed time > maxDurationHours)

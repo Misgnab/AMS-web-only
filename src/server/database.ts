@@ -165,36 +165,19 @@ function seedInitialData() {
       db.prepare("INSERT INTO workspaces (id, name, created_by, status, description) VALUES (1, 'Main Office', NULL, 'ACTIVE', 'Primary Headquarters')").run();
     }
 
-    // 2. Ensure default Super Administrator (0911223344 / admin123) is provisioned
-    const existingDemoAdmin: any = db.prepare("SELECT id, role FROM users WHERE phone_number = ?").get("0911223344");
-    if (!existingDemoAdmin) {
-      console.log("Provisioning default Super Administrator account (0911223344 / admin123)...");
-      const passwordHash = bcrypt.hashSync("admin123", 10);
-      const res = db.prepare(`
-        INSERT INTO users (full_name, phone_number, role, password, hourly_rate, workspace_id, status)
-        VALUES ('System Administrator', '0911223344', 'SuperAdmin', ?, 150.00, 1, 'ACTIVE')
-      `).run(passwordHash);
-      const seededId = Number(res.lastInsertRowid);
-      db.prepare("UPDATE workspaces SET created_by = ? WHERE id = 1 AND (created_by IS NULL OR created_by = 0)").run(seededId);
-      try {
-        db.prepare(`
-          INSERT INTO attendance_scores (user_id, attendance_score, punctuality_percentage, late_count)
-          VALUES (?, 0.0, 0.0, 0)
-        `).run(seededId);
-      } catch (_) {}
-    } else {
-      // Ensure root admin has SuperAdmin role and active status
-      try {
-        db.prepare("UPDATE users SET role = 'SuperAdmin', status = 'ACTIVE' WHERE id = ?").run(existingDemoAdmin.id);
-        db.prepare("UPDATE users SET hourly_rate = 150.00 WHERE id = ? AND hourly_rate = 45.00").run(existingDemoAdmin.id);
-      } catch (_) {}
-      try {
-        const firstAdmin: any = db.prepare("SELECT id FROM users WHERE role = 'SuperAdmin' ORDER BY id ASC LIMIT 1").get();
-        if (firstAdmin?.id) {
-          db.prepare("UPDATE workspaces SET created_by = ? WHERE id = 1 AND (created_by IS NULL OR created_by = 0)").run(firstAdmin.id);
-        }
-      } catch (_) {}
-    }
+    // 2. Production Ready Setup:
+    // Remove uncustomized demo administrator credentials if present to prevent predictable default access
+    try {
+      db.prepare("DELETE FROM users WHERE phone_number = '0911223344' AND full_name = 'System Administrator'").run();
+    } catch (_) {}
+
+    // Ensure workspace created_by links to an active root administrator if one exists
+    try {
+      const activeAdmin: any = db.prepare("SELECT id FROM users WHERE role IN ('SuperAdmin', 'AdminCreator', 'Bootstrap') ORDER BY id ASC LIMIT 1").get();
+      if (activeAdmin?.id) {
+        db.prepare("UPDATE workspaces SET created_by = ? WHERE id = 1 AND (created_by IS NULL OR created_by = 0)").run(activeAdmin.id);
+      }
+    } catch (_) {}
 
     const workspaces = db.prepare("SELECT * FROM workspaces").all() as any[];
 

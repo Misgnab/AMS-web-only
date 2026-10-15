@@ -15,12 +15,14 @@ import { EditCompensationModal } from "./components/EditCompensationModal";
 import { SalaryManagementTab } from "./components/SalaryManagementTab";
 import { WorkingDayStatusCard } from "./components/WorkingDayStatusCard";
 import { AttendanceScheduleSettingsTab } from "./components/AttendanceScheduleSettingsTab";
+import { SuperAdminTab } from "./components/SuperAdminTab";
 import { useRealtimeSync } from "./utils/useRealtimeSync";
 import { OfflineIndicator } from "./components/OfflineIndicator";
 import { EnterprisePayslip, SalaryPayment, User } from "./types";
 import { Footer } from "./components/Footer";
 import { toEthiopian } from "ethiopian-date";
 import { gregorianToEthiopianDate } from "./utils/ethiopianTime.js";
+import { detectActiveAttendanceSession, getWorkspaceShiftWindows } from "./utils/sessionDetection";
 import { getOrCreateDeviceId, getDeviceDisplayName } from "./utils/security.js";
 import { useNetworkTime, getNetworkDate } from "./utils/networkTime.js";
 import { 
@@ -72,7 +74,9 @@ import {
   Database,
   Server,
   ChevronDown,
-  ChevronUp
+  ChevronUp,
+  Building2,
+  ShieldAlert
 } from "lucide-react";
 
 export default function App() {
@@ -149,7 +153,10 @@ export default function App() {
     disburseSalary,
     updateCompensation,
     mySalary,
-    fetchMySalary
+    fetchMySalary,
+    workspaces,
+    currentWorkspaceId,
+    setCurrentWorkspaceId
   } = useAppStore();
 
   // Real-time synchronization via Server-Sent Events (SSE)
@@ -1649,19 +1656,8 @@ MYSQL_DATABASE=your_db_name`}
                 Log In to Portal
               </button>
 
-              <div className="pt-2 text-center">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setLoginPhone("0911223344");
-                    setLoginPassword("admin123");
-                  }}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-medium transition cursor-pointer"
-                  title="Click to fill Demo Admin credentials"
-                >
-                  <span className="text-slate-500">Demo Admin:</span>
-                  <span className="font-mono font-bold text-blue-600">0911223344 / admin123</span>
-                </button>
+              <div className="pt-2 text-center text-xs text-slate-400">
+                <span>Please use your authorized organizational credentials to sign in.</span>
               </div>
             </form>
           )}
@@ -1879,13 +1875,32 @@ MYSQL_DATABASE=your_db_name`}
                       </div>
                     </div>
                     
-                    {/* Live Digital Clock */}
+                    {/* Live Digital Clock & Attendance Session Indicator */}
                     <div className="my-3 relative z-10">
                       <span className="text-3xl font-extrabold text-[#0F172A] tracking-tight font-mono block">
                         {getEthiopianLocalClockTimeString(currentTime)}
                       </span>
-                      <div className="text-[10px] text-amber-600 font-extrabold uppercase tracking-wider mt-0.5">
-                        {getEthiopianTimePeriod(currentTime)}
+                      <div className="flex flex-col items-center gap-1 mt-1">
+                        <div className="text-[10px] text-amber-700 font-extrabold uppercase tracking-wider">
+                          Clock Period: {getEthiopianTimePeriod(currentTime)}
+                        </div>
+                        {(() => {
+                          const nowEthTime = getEthiopianTimeString(currentTime);
+                          const sessionInfo = detectActiveAttendanceSession(nowEthTime, siteSettings);
+                          return (
+                            <span className={`px-2 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider ${
+                              sessionInfo.activeSession === "Morning" ? "bg-blue-100 text-blue-800 border border-blue-200" :
+                              sessionInfo.activeSession === "Afternoon" ? "bg-indigo-100 text-indigo-800 border border-indigo-200" :
+                              sessionInfo.status === "BETWEEN_SHIFTS" ? "bg-amber-100 text-amber-800 border border-amber-200" :
+                              "bg-slate-100 text-slate-700 border border-slate-200"
+                            }`}>
+                              {sessionInfo.activeSession === "Morning" ? "Morning Shift Active" :
+                               sessionInfo.activeSession === "Afternoon" ? "Afternoon Shift Active" :
+                               sessionInfo.status === "BETWEEN_SHIFTS" ? "Between Shifts (Break)" :
+                               sessionInfo.status === "BEFORE_SHIFTS" ? "Pre-Shift Hours" : "Shifts Concluded"}
+                            </span>
+                          );
+                        })()}
                       </div>
                       <div className="text-xs text-gray-500 font-medium mt-1">
                         {getEthiopianNiceDateString(currentTime)}
@@ -1903,23 +1918,43 @@ MYSQL_DATABASE=your_db_name`}
 
                     {/* Sessions section */}
                     <div className="space-y-4 text-left mt-4">
-                      {/* Morning Session Block */}
+                      {/* Morning & Afternoon Session Blocks */}
                       {(() => {
                         const morningRecord = Array.isArray(todayAttendance) ? todayAttendance.find(r => r.session === "Morning") : null;
                         const afternoonRecord = Array.isArray(todayAttendance) ? todayAttendance.find(r => r.session === "Afternoon") : null;
                         
                         const now = currentTime;
-                        const currentHour = parseInt(getEthiopianTimeString(now).split(":")[0], 10);
-                        const isMorningSession = currentHour < 6;
+                        const nowEthTime = getEthiopianTimeString(now);
+                        const sessionResult = detectActiveAttendanceSession(nowEthTime, siteSettings);
+                        const activeSession = sessionResult.activeSession;
+                        const shiftWindows = sessionResult.shiftWindows;
                         
                         const hasActiveMorningCheckIn = !!(morningRecord && !morningRecord.check_out_time);
                         const hasActiveAfternoonCheckIn = !!(afternoonRecord && !afternoonRecord.check_out_time);
                         
-                        const showMorning = isMorningSession || hasActiveMorningCheckIn;
-                        const showAfternoon = !isMorningSession || hasActiveAfternoonCheckIn;
+                        const showMorning = activeSession === "Morning" || hasActiveMorningCheckIn || !!morningRecord;
+                        const showAfternoon = activeSession === "Afternoon" || hasActiveAfternoonCheckIn || !!afternoonRecord;
 
                         return (
                           <>
+                            {/* Clear Between-Shifts / Outside Hours Advisory Banner */}
+                            {!activeSession && !hasActiveMorningCheckIn && !hasActiveAfternoonCheckIn && (
+                              <div className="p-3.5 bg-amber-50/90 rounded-2xl border border-amber-200 text-left space-y-1.5 shadow-sm">
+                                <div className="flex items-center gap-1.5 font-bold text-xs text-amber-900">
+                                  <Clock size={15} className="text-amber-600 shrink-0" />
+                                  <span>{sessionResult.status === "BETWEEN_SHIFTS" ? "Between Shifts (Break)" : sessionResult.status === "BEFORE_SHIFTS" ? "Pre-Shift Window" : "Shift Hours Concluded"}</span>
+                                </div>
+                                <p className="text-[11px] text-amber-800 leading-relaxed font-medium">
+                                  {sessionResult.message}
+                                </p>
+                                <div className="flex items-center gap-2 text-[10px] text-amber-700 font-semibold pt-1 border-t border-amber-200/50">
+                                  <span>Morning: {shiftWindows.morningStartStr} – {shiftWindows.morningEndStr}</span>
+                                  <span>•</span>
+                                  <span>Afternoon: {shiftWindows.afternoonStartStr} – {shiftWindows.afternoonEndStr}</span>
+                                </div>
+                              </div>
+                            )}
+
                             {showMorning && (
                               <div className="p-4 bg-slate-50 rounded-2xl border border-slate-100 space-y-3">
                                 <div className="flex justify-between items-center">
@@ -1936,7 +1971,7 @@ MYSQL_DATABASE=your_db_name`}
                                           : "Working Shift"}
                                       </span>
                                     </div>
-                                    <p className="text-[10px] text-gray-400">02:00 - 06:00 (Ethiopian Time)</p>
+                                    <p className="text-[10px] text-gray-400">{shiftWindows.morningStartStr} – {shiftWindows.morningEndStr} (Ethiopian Time)</p>
                                   </div>
                                   {morningRecord ? (
                                     <span className={`px-2.5 py-0.5 rounded-full text-[10px] font-bold ${
@@ -1980,17 +2015,22 @@ MYSQL_DATABASE=your_db_name`}
                                   {!morningRecord ? (
                                     <button
                                       onClick={() => handleRealScan("Morning")}
-                                      disabled={isScanning}
-                                      className="w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold py-2.5 px-4 rounded-xl shadow-md shadow-blue-600/10 transition flex items-center justify-center gap-2 text-xs active:scale-[0.98]"
+                                      disabled={isScanning || activeSession !== "Morning"}
+                                      title={activeSession !== "Morning" ? "Morning check-in is only available during the morning session" : undefined}
+                                      className={`w-full font-semibold py-2.5 px-4 rounded-xl shadow-md transition flex items-center justify-center gap-2 text-xs active:scale-[0.98] ${
+                                        activeSession === "Morning" 
+                                          ? "bg-blue-600 hover:bg-blue-700 text-white shadow-blue-600/10 cursor-pointer" 
+                                          : "bg-slate-200 text-slate-400 cursor-not-allowed shadow-none"
+                                      }`}
                                     >
                                       <QrCode size={14} />
-                                      {isScanning ? "Scanning..." : "Check-In Morning"}
+                                      {isScanning ? "Scanning..." : activeSession === "Morning" ? "Check-In Morning" : "Morning Check-In Closed"}
                                     </button>
                                   ) : !morningRecord.check_out_time ? (
                                     <button
                                       onClick={() => handleRealCheckOut("Morning")}
                                       disabled={isScanning}
-                                      className="w-full bg-rose-600 hover:bg-rose-700 text-white font-semibold py-2.5 px-4 rounded-xl shadow-md shadow-rose-600/10 transition flex items-center justify-center gap-2 text-xs active:scale-[0.98]"
+                                      className="w-full bg-rose-600 hover:bg-rose-700 text-white font-semibold py-2.5 px-4 rounded-xl shadow-md shadow-rose-600/10 transition flex items-center justify-center gap-2 text-xs active:scale-[0.98] cursor-pointer"
                                     >
                                       <LogOut size={14} />
                                       {isScanning ? "Processing..." : "Check-Out Morning"}
@@ -2020,7 +2060,7 @@ MYSQL_DATABASE=your_db_name`}
                                           : "Working Shift"}
                                       </span>
                                     </div>
-                                    <p className="text-[10px] text-gray-400">07:00 - 11:00 (Ethiopian Time)</p>
+                                    <p className="text-[10px] text-gray-400">{shiftWindows.afternoonStartStr} – {shiftWindows.afternoonEndStr} (Ethiopian Time)</p>
                                   </div>
                                   {afternoonRecord ? (
                                     <span className={`px-2.5 py-0.5 rounded-full text-[10px] font-bold ${
@@ -2064,17 +2104,22 @@ MYSQL_DATABASE=your_db_name`}
                                   {!afternoonRecord ? (
                                     <button
                                       onClick={() => handleRealScan("Afternoon")}
-                                      disabled={isScanning}
-                                      className="w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold py-2.5 px-4 rounded-xl shadow-md shadow-blue-600/10 transition flex items-center justify-center gap-2 text-xs active:scale-[0.98]"
+                                      disabled={isScanning || activeSession !== "Afternoon"}
+                                      title={activeSession !== "Afternoon" ? "Afternoon check-in is only available during the afternoon session" : undefined}
+                                      className={`w-full font-semibold py-2.5 px-4 rounded-xl shadow-md transition flex items-center justify-center gap-2 text-xs active:scale-[0.98] ${
+                                        activeSession === "Afternoon" 
+                                          ? "bg-blue-600 hover:bg-blue-700 text-white shadow-blue-600/10 cursor-pointer" 
+                                          : "bg-slate-200 text-slate-400 cursor-not-allowed shadow-none"
+                                      }`}
                                     >
                                       <QrCode size={14} />
-                                      {isScanning ? "Scanning..." : "Check-In Afternoon"}
+                                      {isScanning ? "Scanning..." : activeSession === "Afternoon" ? "Check-In Afternoon" : "Afternoon Check-In Closed"}
                                     </button>
                                   ) : !afternoonRecord.check_out_time ? (
                                     <button
                                       onClick={() => handleRealCheckOut("Afternoon")}
                                       disabled={isScanning}
-                                      className="w-full bg-rose-600 hover:bg-rose-700 text-white font-semibold py-2.5 px-4 rounded-xl shadow-md shadow-rose-600/10 transition flex items-center justify-center gap-2 text-xs active:scale-[0.98]"
+                                      className="w-full bg-rose-600 hover:bg-rose-700 text-white font-semibold py-2.5 px-4 rounded-xl shadow-md shadow-rose-600/10 transition flex items-center justify-center gap-2 text-xs active:scale-[0.98] cursor-pointer"
                                     >
                                       <LogOut size={14} />
                                       {isScanning ? "Processing..." : "Check-Out Afternoon"}
@@ -2922,10 +2967,29 @@ MYSQL_DATABASE=your_db_name`}
           <div className="min-w-0 flex-1">
             <h1 className="text-xs sm:text-sm md:text-lg font-bold tracking-tight flex items-center gap-1.5 truncate">
               <span className="truncate">{user.full_name}</span>
-              {user.workspace_name && (
+              {user.workspace_name && user.role !== "SuperAdmin" && (
                 <span className="text-[9px] md:text-[10px] bg-blue-500/20 text-blue-300 px-1.5 py-0.5 rounded font-black uppercase tracking-wider shrink-0 hidden xs:inline-block">
                   {user.workspace_name}
                 </span>
+              )}
+              {user.role === "SuperAdmin" && workspaces.length > 0 && (
+                <div className="hidden sm:inline-flex items-center ml-2 shrink-0">
+                  <select
+                    value={currentWorkspaceId === null || currentWorkspaceId === "all" ? "all" : String(currentWorkspaceId)}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      setCurrentWorkspaceId(val === "all" ? "all" : parseInt(val, 10));
+                    }}
+                    className="bg-slate-800 text-indigo-300 border border-indigo-500/40 text-[10px] md:text-xs font-bold rounded-lg px-2 py-0.5 focus:outline-none"
+                  >
+                    <option value="all">🏢 Global (All Workspaces)</option>
+                    {workspaces.map((w) => (
+                      <option key={w.id} value={String(w.id)}>
+                        #{w.id}: {w.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
               )}
             </h1>
             <p className="text-[10px] md:text-xs text-slate-400 font-medium flex items-center gap-1.5 truncate">
@@ -3138,6 +3202,22 @@ MYSQL_DATABASE=your_db_name`}
               <nav className="space-y-1">
                 {user?.role !== "Bootstrap" && (
                   <>
+                    {user?.role === "SuperAdmin" && (
+                      <button
+                        onClick={() => { setActiveTab("superadmin"); setIsMobileMenuOpen(false); }}
+                        className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-sm font-semibold text-left transition ${
+                          activeTab === "superadmin"
+                            ? "bg-indigo-600 text-white font-bold shadow-md shadow-indigo-100"
+                            : "text-indigo-700 bg-indigo-50/70 hover:bg-indigo-100 font-bold"
+                        }`}
+                      >
+                        <ShieldAlert size={18} className={activeTab === "superadmin" ? "text-white" : "text-indigo-600"} />
+                        <span>Super Admin Console</span>
+                        <span className={`ml-auto text-[10px] px-1.5 py-0.5 rounded-full font-bold ${activeTab === "superadmin" ? "bg-white/20 text-white" : "bg-indigo-200 text-indigo-800"}`}>
+                          Global
+                        </span>
+                      </button>
+                    )}
                     <button
                       onClick={() => { setActiveTab("dashboard"); setIsMobileMenuOpen(false); }}
                       className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-sm font-semibold text-left transition ${
@@ -3321,6 +3401,22 @@ MYSQL_DATABASE=your_db_name`}
               <nav className="space-y-1">
                 {user?.role !== "Bootstrap" && (
                   <>
+                    {user?.role === "SuperAdmin" && (
+                      <button
+                        onClick={() => setActiveTab("superadmin")}
+                        className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-sm font-semibold text-left transition ${
+                          activeTab === "superadmin"
+                            ? "bg-indigo-600 text-white font-bold shadow-md shadow-indigo-100"
+                            : "text-indigo-700 bg-indigo-50/70 hover:bg-indigo-100 font-bold"
+                        }`}
+                      >
+                        <ShieldAlert size={18} className={activeTab === "superadmin" ? "text-white" : "text-indigo-600"} />
+                        <span>Super Admin Console</span>
+                        <span className={`ml-auto text-[10px] px-1.5 py-0.5 rounded-full font-bold ${activeTab === "superadmin" ? "bg-white/20 text-white" : "bg-indigo-200 text-indigo-800"}`}>
+                          Global
+                        </span>
+                      </button>
+                    )}
                     <button
                       onClick={() => setActiveTab("dashboard")}
                       className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-sm font-semibold text-left transition ${
@@ -3875,12 +3971,14 @@ MYSQL_DATABASE=your_db_name`}
                           );
                         }
 
+                        const nowEthStr = getEthiopianTimeString(currentTime);
+                        const currentSessionDetect = detectActiveAttendanceSession(nowEthStr, siteSettings);
+                        const isMorningNow = currentSessionDetect.activeSession === "Morning" || currentSessionDetect.status === "BEFORE_SHIFTS";
+
                         return groupedList.map((g) => {
                           const totalHrs = parseFloat(
                             ((g.morning?.total_hours || 0) + (g.afternoon?.total_hours || 0)).toFixed(2)
                           );
-                          const currentEthHour = parseInt(getEthiopianTimeString(currentTime).split(":")[0], 10);
-                          const isMorningNow = currentEthHour < 6;
 
                           const isMorningOt = g.morning && (
                             isTodayNonWorking || 
@@ -5045,14 +5143,13 @@ MYSQL_DATABASE=your_db_name`}
                   const afternoonRecord = Array.isArray(todayAttendance) ? todayAttendance.find(r => r.session === "Afternoon") : null;
                   
                   const now = currentTime;
-                  const currentHour = parseInt(getEthiopianTimeString(now).split(":")[0], 10);
-                  const isMorningSession = currentHour < 6;
+                  const nowEthTime = getEthiopianTimeString(now);
+                  const sessionResult = detectActiveAttendanceSession(nowEthTime, siteSettings);
+                  const activeSession = sessionResult.activeSession;
+                  const shiftWindows = sessionResult.shiftWindows;
                   
                   const hasActiveMorningCheckIn = !!(morningRecord && !morningRecord.check_out_time);
                   const hasActiveAfternoonCheckIn = !!(afternoonRecord && !afternoonRecord.check_out_time);
-                  
-                  const showMorning = isMorningSession || hasActiveMorningCheckIn;
-                  const showAfternoon = !isMorningSession || hasActiveAfternoonCheckIn;
 
                   return (
                     <div className="space-y-4 w-full">
@@ -5065,117 +5162,159 @@ MYSQL_DATABASE=your_db_name`}
                         />
                       </div>
 
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                        {showMorning && (
-                          <div className={`p-3.5 rounded-xl border text-xs font-bold text-left space-y-1.5 ${
-                            morningRecord 
-                              ? "bg-emerald-50 text-emerald-800 border-emerald-200" 
-                              : "bg-slate-50 text-slate-600 border-slate-200"
-                          }`}>
-                            <div className="flex items-center justify-between">
-                              <p className="uppercase text-[10px] text-gray-500 font-bold">Morning Session (02:00 - 06:00)</p>
-                              <span className={`px-2 py-0.5 rounded text-[9px] font-black uppercase tracking-wider ${
-                                (effectiveWorkStatus?.morning_status === "NON_WORKING" || (!effectiveWorkStatus && currentTime.getDay() === 0))
-                                  ? "bg-amber-100 text-amber-800 border border-amber-200"
-                                  : "bg-emerald-100 text-emerald-800 border border-emerald-200"
-                              }`}>
-                                {(effectiveWorkStatus?.morning_status === "NON_WORKING" || (!effectiveWorkStatus && currentTime.getDay() === 0))
-                                  ? "Non-Working / OT"
-                                  : "Working Shift"}
-                              </span>
-                            </div>
-                            {morningRecord ? (
-                              <div className="font-mono text-slate-800">
-                                Checked In: {morningRecord.check_in_time}
-                                {morningRecord.check_out_time ? ` | Checked Out: ${morningRecord.check_out_time}` : " (Active)"}
-                              </div>
-                            ) : (
-                              <div className="text-slate-400 font-normal">Not Checked In</div>
-                            )}
+                      {/* Clear Between-Shifts / Outside Hours Advisory Banner */}
+                      {!activeSession && !hasActiveMorningCheckIn && !hasActiveAfternoonCheckIn && (
+                        <div className="p-3.5 bg-amber-50/90 rounded-2xl border border-amber-200 text-left space-y-1.5 shadow-xs">
+                          <div className="flex items-center gap-1.5 font-bold text-xs text-amber-900">
+                            <Clock size={15} className="text-amber-600 shrink-0" />
+                            <span>{sessionResult.status === "BETWEEN_SHIFTS" ? "Between Shifts (Break)" : sessionResult.status === "BEFORE_SHIFTS" ? "Pre-Shift Window" : "Shift Hours Concluded"}</span>
                           </div>
-                        )}
+                          <p className="text-[11px] text-amber-800 leading-relaxed font-medium">
+                            {sessionResult.message}
+                          </p>
+                          <div className="flex items-center gap-2 text-[10px] text-amber-700 font-semibold pt-1 border-t border-amber-200/50">
+                            <span>Morning: {shiftWindows.morningStartStr} – {shiftWindows.morningEndStr}</span>
+                            <span>•</span>
+                            <span>Afternoon: {shiftWindows.afternoonStartStr} – {shiftWindows.afternoonEndStr}</span>
+                          </div>
+                        </div>
+                      )}
 
-                        {showAfternoon && (
-                          <div className={`p-3.5 rounded-xl border text-xs font-bold text-left space-y-1.5 ${
-                            afternoonRecord 
-                              ? "bg-emerald-50 text-emerald-800 border-emerald-200" 
-                              : "bg-slate-50 text-slate-600 border-slate-200"
-                          }`}>
-                            <div className="flex items-center justify-between">
-                              <p className="uppercase text-[10px] text-gray-500 font-bold">Afternoon Session (07:00 - 11:00)</p>
-                              <span className={`px-2 py-0.5 rounded text-[9px] font-black uppercase tracking-wider ${
-                                (effectiveWorkStatus?.afternoon_status === "NON_WORKING" || (!effectiveWorkStatus && (currentTime.getDay() === 0 || currentTime.getDay() === 6)))
-                                  ? "bg-amber-100 text-amber-800 border border-amber-200"
-                                  : "bg-emerald-100 text-emerald-800 border border-emerald-200"
-                              }`}>
-                                {(effectiveWorkStatus?.afternoon_status === "NON_WORKING" || (!effectiveWorkStatus && (currentTime.getDay() === 0 || currentTime.getDay() === 6)))
-                                  ? "Non-Working / OT"
-                                  : "Working Shift"}
-                              </span>
-                            </div>
-                            {afternoonRecord ? (
-                              <div className="font-mono text-slate-800">
-                                Checked In: {afternoonRecord.check_in_time}
-                                {afternoonRecord.check_out_time ? ` | Checked Out: ${afternoonRecord.check_out_time}` : " (Active)"}
-                              </div>
-                            ) : (
-                              <div className="text-slate-400 font-normal">Not Checked In</div>
-                            )}
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                        {/* Morning Card */}
+                        <div className={`p-3.5 rounded-xl border text-xs font-bold text-left space-y-1.5 ${
+                          morningRecord 
+                            ? "bg-emerald-50 text-emerald-800 border-emerald-200" 
+                            : activeSession === "Morning"
+                            ? "bg-blue-50 text-blue-900 border-blue-200"
+                            : "bg-slate-50 text-slate-600 border-slate-200"
+                        }`}>
+                          <div className="flex items-center justify-between">
+                            <p className="uppercase text-[10px] text-gray-500 font-bold">
+                              Morning Session ({shiftWindows.morningStartStr} – {shiftWindows.morningEndStr})
+                            </p>
+                            <span className={`px-2 py-0.5 rounded text-[9px] font-black uppercase tracking-wider ${
+                              (effectiveWorkStatus?.morning_status === "NON_WORKING" || (!effectiveWorkStatus && currentTime.getDay() === 0))
+                                ? "bg-amber-100 text-amber-800 border border-amber-200"
+                                : "bg-emerald-100 text-emerald-800 border border-emerald-200"
+                            }`}>
+                              {(effectiveWorkStatus?.morning_status === "NON_WORKING" || (!effectiveWorkStatus && currentTime.getDay() === 0))
+                                ? "Non-Working / OT"
+                                : "Working Shift"}
+                            </span>
                           </div>
-                        )}
+                          {morningRecord ? (
+                            <div className="font-mono text-slate-800">
+                              Checked In: {morningRecord.check_in_time}
+                              {morningRecord.check_out_time ? ` | Checked Out: ${morningRecord.check_out_time}` : " (Active)"}
+                            </div>
+                          ) : (
+                            <div className="text-slate-400 font-normal">
+                              {activeSession === "Morning" ? "Session Active — Ready for Check-in" : "Not Checked In"}
+                            </div>
+                          )}
+                        </div>
+
+                        {/* Afternoon Card */}
+                        <div className={`p-3.5 rounded-xl border text-xs font-bold text-left space-y-1.5 ${
+                          afternoonRecord 
+                            ? "bg-emerald-50 text-emerald-800 border-emerald-200" 
+                            : activeSession === "Afternoon"
+                            ? "bg-indigo-50 text-indigo-900 border-indigo-200"
+                            : "bg-slate-50 text-slate-600 border-slate-200"
+                        }`}>
+                          <div className="flex items-center justify-between">
+                            <p className="uppercase text-[10px] text-gray-500 font-bold">
+                              Afternoon Session ({shiftWindows.afternoonStartStr} – {shiftWindows.afternoonEndStr})
+                            </p>
+                            <span className={`px-2 py-0.5 rounded text-[9px] font-black uppercase tracking-wider ${
+                              (effectiveWorkStatus?.afternoon_status === "NON_WORKING" || (!effectiveWorkStatus && (currentTime.getDay() === 0 || currentTime.getDay() === 6)))
+                                ? "bg-amber-100 text-amber-800 border border-amber-200"
+                                : "bg-emerald-100 text-emerald-800 border border-emerald-200"
+                            }`}>
+                              {(effectiveWorkStatus?.afternoon_status === "NON_WORKING" || (!effectiveWorkStatus && (currentTime.getDay() === 0 || currentTime.getDay() === 6)))
+                                ? "Non-Working / OT"
+                                : "Working Shift"}
+                            </span>
+                          </div>
+                          {afternoonRecord ? (
+                            <div className="font-mono text-slate-800">
+                              Checked In: {afternoonRecord.check_in_time}
+                              {afternoonRecord.check_out_time ? ` | Checked Out: ${afternoonRecord.check_out_time}` : " (Active)"}
+                            </div>
+                          ) : (
+                            <div className="text-slate-400 font-normal">
+                              {activeSession === "Afternoon" ? "Session Active — Ready for Check-in" : "Not Checked In"}
+                            </div>
+                          )}
+                        </div>
                       </div>
 
                       {/* Action buttons */}
                       <div className="flex flex-wrap gap-2.5 justify-center pt-2">
                         {/* Morning controls */}
-                        {showMorning && (
-                          <div className="flex gap-2">
-                            {!morningRecord ? (
-                              <button
-                                onClick={() => handleRealScan("Morning")}
-                                disabled={isScanning}
-                                className="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-xl text-xs transition disabled:opacity-50"
-                              >
-                                {isScanning ? "Processing..." : "Check In Morning"}
-                              </button>
-                            ) : !morningRecord.check_out_time ? (
-                              <button
-                                onClick={() => handleRealCheckOut("Morning")}
-                                disabled={isScanning}
-                                className="bg-rose-600 hover:bg-rose-700 text-white font-bold py-2 px-4 rounded-xl text-xs transition disabled:opacity-50"
-                              >
-                                {isScanning ? "Processing..." : "Check Out Morning"}
-                              </button>
-                            ) : (
-                              <span className="text-emerald-600 font-bold text-xs p-2 bg-emerald-50 border border-emerald-100 rounded-lg">Morning Completed</span>
-                            )}
-                          </div>
-                        )}
+                        <div className="flex gap-2">
+                          {!morningRecord ? (
+                            <button
+                              onClick={() => handleRealScan("Morning")}
+                              disabled={isScanning || activeSession !== "Morning"}
+                              title={activeSession !== "Morning" ? `Morning check-in is only available during the morning session (${shiftWindows.morningStartStr} – ${shiftWindows.morningEndStr})` : undefined}
+                              className={`font-bold py-2 px-4 rounded-xl text-xs transition flex items-center gap-1.5 ${
+                                activeSession === "Morning"
+                                  ? "bg-blue-600 hover:bg-blue-700 text-white cursor-pointer shadow-sm shadow-blue-500/20 active:scale-95"
+                                  : "bg-slate-200 text-slate-400 cursor-not-allowed shadow-none"
+                              }`}
+                            >
+                              <QrCode size={13} />
+                              {isScanning ? "Processing..." : activeSession === "Morning" ? "Check In Morning" : "Morning Check-In Closed"}
+                            </button>
+                          ) : !morningRecord.check_out_time ? (
+                            <button
+                              onClick={() => handleRealCheckOut("Morning")}
+                              disabled={isScanning}
+                              className="bg-rose-600 hover:bg-rose-700 text-white font-bold py-2 px-4 rounded-xl text-xs transition disabled:opacity-50 flex items-center gap-1.5 cursor-pointer active:scale-95 shadow-sm shadow-rose-500/20"
+                            >
+                              <LogOut size={13} />
+                              {isScanning ? "Processing..." : "Check Out Morning"}
+                            </button>
+                          ) : (
+                            <span className="text-emerald-700 font-bold text-xs px-3 py-1.5 bg-emerald-50 border border-emerald-200 rounded-xl flex items-center gap-1">
+                              <Check size={13} /> Morning Completed
+                            </span>
+                          )}
+                        </div>
 
                         {/* Afternoon controls */}
-                        {showAfternoon && (
-                          <div className="flex gap-2">
-                            {!afternoonRecord ? (
-                              <button
-                                onClick={() => handleRealScan("Afternoon")}
-                                disabled={isScanning}
-                                className="bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-2 px-4 rounded-xl text-xs transition disabled:opacity-50"
-                              >
-                                {isScanning ? "Processing..." : "Check In Afternoon"}
-                              </button>
-                            ) : !afternoonRecord.check_out_time ? (
-                              <button
-                                onClick={() => handleRealCheckOut("Afternoon")}
-                                disabled={isScanning}
-                                className="bg-rose-600 hover:bg-rose-700 text-white font-bold py-2 px-4 rounded-xl text-xs transition disabled:opacity-50"
-                              >
-                                {isScanning ? "Processing..." : "Check Out Afternoon"}
-                              </button>
-                            ) : (
-                              <span className="text-emerald-600 font-bold text-xs p-2 bg-emerald-50 border border-emerald-100 rounded-lg">Afternoon Completed</span>
-                            )}
-                          </div>
-                        )}
+                        <div className="flex gap-2">
+                          {!afternoonRecord ? (
+                            <button
+                              onClick={() => handleRealScan("Afternoon")}
+                              disabled={isScanning || activeSession !== "Afternoon"}
+                              title={activeSession !== "Afternoon" ? `Afternoon check-in is only available during the afternoon session (${shiftWindows.afternoonStartStr} – ${shiftWindows.afternoonEndStr})` : undefined}
+                              className={`font-bold py-2 px-4 rounded-xl text-xs transition flex items-center gap-1.5 ${
+                                activeSession === "Afternoon"
+                                  ? "bg-indigo-600 hover:bg-indigo-700 text-white cursor-pointer shadow-sm shadow-indigo-500/20 active:scale-95"
+                                  : "bg-slate-200 text-slate-400 cursor-not-allowed shadow-none"
+                              }`}
+                            >
+                              <QrCode size={13} />
+                              {isScanning ? "Processing..." : activeSession === "Afternoon" ? "Check In Afternoon" : "Afternoon Check-In Closed"}
+                            </button>
+                          ) : !afternoonRecord.check_out_time ? (
+                            <button
+                              onClick={() => handleRealCheckOut("Afternoon")}
+                              disabled={isScanning}
+                              className="bg-rose-600 hover:bg-rose-700 text-white font-bold py-2 px-4 rounded-xl text-xs transition disabled:opacity-50 flex items-center gap-1.5 cursor-pointer active:scale-95 shadow-sm shadow-rose-500/20"
+                            >
+                              <LogOut size={13} />
+                              {isScanning ? "Processing..." : "Check Out Afternoon"}
+                            </button>
+                          ) : (
+                            <span className="text-emerald-700 font-bold text-xs px-3 py-1.5 bg-emerald-50 border border-emerald-200 rounded-xl flex items-center gap-1">
+                              <Check size={13} /> Afternoon Completed
+                            </span>
+                          )}
+                        </div>
                       </div>
                     </div>
                   );
@@ -6316,6 +6455,25 @@ MYSQL_DATABASE=your_db_name`}
           {/* Module 13: Attendance & Work Schedule Settings Page */}
           {activeTab === "attendance_settings" && (
             <AttendanceScheduleSettingsTab />
+          )}
+
+          {/* Module 14: Centralized Super Admin Management Console */}
+          {activeTab === "superadmin" && (
+            user?.role === "SuperAdmin" ? (
+              <SuperAdminTab />
+            ) : (
+              <div className="bg-white rounded-2xl p-8 border border-rose-200 text-center max-w-lg mx-auto space-y-3">
+                <ShieldAlert size={40} className="text-rose-500 mx-auto" />
+                <h3 className="text-base font-bold text-slate-800">Super Admin Access Required</h3>
+                <p className="text-xs text-gray-500">Only authorized global Super Administrators can access this console.</p>
+                <button
+                  onClick={() => setActiveTab("dashboard")}
+                  className="px-4 py-2 bg-indigo-600 text-white rounded-xl text-xs font-bold"
+                >
+                  Return to Dashboard
+                </button>
+              </div>
+            )
           )}
 
           <div className="pt-6 pb-2 mt-auto">

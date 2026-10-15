@@ -1,5 +1,6 @@
 import { Request, Response, NextFunction } from "express";
 import { logAuditEvent } from "./auditService.ts";
+import { db } from "./db/databaseManager.ts";
 
 export type Permission =
   | "employees.view"
@@ -197,6 +198,27 @@ export function getAuthorizedWorkspaceId(req: AuthenticatedRequest, requestedWsI
 }
 
 /**
+ * Returns all workspace IDs assigned to a user (primary workspace + any in workspace_assignments)
+ */
+export function getAuthorizedWorkspaceIds(userId?: number, primaryWsId?: number | null): number[] {
+  const ids: number[] = [];
+  if (primaryWsId) ids.push(Number(primaryWsId));
+  if (!userId) return ids.length > 0 ? ids : [1];
+  try {
+    const rows = db.prepare("SELECT workspace_id FROM workspace_assignments WHERE user_id = ?").all(userId) as any[];
+    if (rows && rows.length > 0) {
+      for (const r of rows) {
+        const id = Number(r.workspace_id);
+        if (id && !ids.includes(id)) {
+          ids.push(id);
+        }
+      }
+    }
+  } catch (_) {}
+  return ids.length > 0 ? ids : [1];
+}
+
+/**
  * Validates that an operation targets the authenticated user's authorized workspace.
  * Returns true if authorized, false otherwise.
  */
@@ -204,7 +226,11 @@ export function validateWorkspaceAccess(req: AuthenticatedRequest, resourceWorks
   if (isSuperAdmin(req.user)) return true;
   if (!req.user?.workspace_id) return false;
   if (resourceWorkspaceId === undefined || resourceWorkspaceId === null) return true;
-  return Number(resourceWorkspaceId) === Number(req.user.workspace_id);
+  const target = Number(resourceWorkspaceId);
+  const primary = Number(req.user.workspace_id);
+  if (target === primary) return true;
+  const authorizedIds = getAuthorizedWorkspaceIds(req.user.id, primary);
+  return authorizedIds.includes(target);
 }
 
 /**
@@ -275,6 +301,11 @@ export function enforceWorkspaceScope(
   const targetWsId = resourceWorkspaceId !== undefined && resourceWorkspaceId !== null ? Number(resourceWorkspaceId) : userWsId;
 
   if (targetWsId !== userWsId) {
+    const authorizedIds = getAuthorizedWorkspaceIds(req.user?.id, userWsId);
+    if (authorizedIds.includes(targetWsId)) {
+      return true;
+    }
+
     logAuditEvent({
       workspaceId: userWsId,
       userId: req.user?.id,

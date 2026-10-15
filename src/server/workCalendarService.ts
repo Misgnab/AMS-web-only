@@ -1,5 +1,6 @@
 import { db } from "./database.ts";
 import { toEthiopian, toGregorian } from "ethiopian-date";
+import { parseTimeToEthiopianMinutes } from "../utils/sessionDetection.ts";
 import type { 
   EffectiveWorkStatus, 
   WorkScheduleDay, 
@@ -287,14 +288,14 @@ export class WorkCalendarService {
     let normalEndMins = 390;   // Default 06:30 (12:30 PM)
 
     if (session === "Morning") {
-      normalStartMins = settingToEthMinutes(settings?.morning_start_time || settings?.work_start_time, 150);
-      normalEndMins = settingToEthMinutes(settings?.morning_end_time, 390);
+      normalStartMins = parseTimeToEthiopianMinutes(settings?.morning_start_time || settings?.work_start_time, "MorningStart") ?? 120;
+      normalEndMins = parseTimeToEthiopianMinutes(settings?.morning_end_time, "MorningEnd") ?? 360;
     } else if (session === "Afternoon") {
-      normalStartMins = settingToEthMinutes(settings?.afternoon_start_time, 450);
-      normalEndMins = settingToEthMinutes(settings?.afternoon_end_time || settings?.work_end_time, 690);
+      normalStartMins = parseTimeToEthiopianMinutes(settings?.afternoon_start_time, "AfternoonStart") ?? 420;
+      normalEndMins = parseTimeToEthiopianMinutes(settings?.afternoon_end_time || settings?.work_end_time, "AfternoonEnd") ?? 660;
     } else {
-      normalStartMins = settingToEthMinutes(settings?.work_start_time, 150);
-      normalEndMins = settingToEthMinutes(settings?.work_end_time, 690);
+      normalStartMins = parseTimeToEthiopianMinutes(settings?.morning_start_time || settings?.work_start_time, "MorningStart") ?? 120;
+      normalEndMins = parseTimeToEthiopianMinutes(settings?.afternoon_end_time || settings?.work_end_time, "AfternoonEnd") ?? 660;
     }
 
     const inMinutes = punchToEthMinutes(checkInTimeStr, normalStartMins, session);
@@ -373,7 +374,7 @@ export class WorkCalendarService {
       // 3. Post-shift overtime (work after normal schedule and configured overtime start time):
       let postOtHours = 0;
       const configuredOtStartMins = (session === "Afternoon" || !session) && settings?.overtime_start_time
-        ? settingToEthMinutes(settings.overtime_start_time, normalEndMins)
+        ? (parseTimeToEthiopianMinutes(settings.overtime_start_time, "AfternoonEnd") ?? normalEndMins)
         : normalEndMins;
       const effectiveOtThreshold = Math.max(normalEndMins, configuredOtStartMins);
 
