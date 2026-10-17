@@ -37,30 +37,19 @@ import {
   formatEthiopianTimeRange,
   gregorianToEthiopianDate,
   ethiopianToGregorianDate,
-  ethiopianToGregorianTime
+  ethiopianToGregorianTime,
+  getEthiopianTimeString,
+  parseTimeToEthMinutes,
+  determineAttendanceSession,
+  formatEthMinutesToStr
 } from "./src/utils/ethiopianTime.ts";
-import {
-  parseTimeToEthiopianMinutes,
-  formatMinutesToEthiopianTimeStr,
-  detectActiveAttendanceSession,
-  getWorkspaceShiftWindows
-} from "./src/utils/sessionDetection.ts";
-import { logAuditEvent } from "./src/server/auditService.ts";
-import {
-  hasPermission,
-  isSuperAdmin,
-  isWorkspaceAdmin,
-  isStaffManager,
-  getAuthorizedWorkspaceId,
-  validateWorkspaceAccess,
-  requirePermission,
-  requireSuperAdmin,
-  enforceWorkspaceScope
-} from "./src/server/rbac.ts";
-import { runAutomatedSecurityTests } from "./src/server/tests/securityTests.ts";
-import { runAttendanceSessionTests } from "./src/server/tests/sessionDetectionTests.ts";
+import { hasPermission, recordAuditLog, getClientIp } from "./src/server/rbac.ts";
+import { superAdminRouter } from "./src/server/superAdminRoutes.ts";
 
 // Initialize the database and seed it
+try {
+  databaseManager.tryReconnect();
+} catch (_) {}
 initDatabase();
 
 const app = express();
@@ -195,45 +184,39 @@ function convertGregorianToEthiopianDate(gDateStr: string): string {
   }
 }
 
-function getEthiopianTimeString(date: Date = new Date()): string {
-  try {
-    const formatter = new Intl.DateTimeFormat('en-GB', {
-      timeZone: 'Africa/Addis_Ababa',
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit',
-      hour12: false
-    });
-    const formatted = formatter.format(date);
-    const parts = formatted.split(":");
-    const h = parseInt(parts[0], 10);
-    const m = parts[1];
-    const s = parts[2];
-    
-    const ethH = (h - 6 + 24) % 24;
-    return `${String(ethH).padStart(2, "0")}:${m}:${s}`;
-  } catch (err) {
-    console.error("Error converting time to Ethiopian:", err);
-    const formatter = new Intl.DateTimeFormat('en-GB', {
-      timeZone: 'Africa/Addis_Ababa',
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit',
-      hour12: false
-    });
-    return formatter.format(date);
-  }
-}
 
 app.use(express.json({ limit: "10mb" }));
 
 // --- HEALTH CHECK ENDPOINT ---
 app.get("/api/health", (req, res) => {
-  let dbStatus = databaseManager.isReady() ? "connected" : "disconnected";
+  const isReady = databaseManager.isReady();
+  const authHeader = req.headers["authorization"];
+  const token = authHeader && authHeader.startsWith("Bearer ") ? authHeader.split(" ")[1] : null;
+
+  let isAdmin = false;
+  if (token) {
+    try {
+      const decoded: any = jwt.verify(token, JWT_SECRET);
+      if (["SuperAdmin", "AdminCreator", "AdminManager", "Bootstrap"].includes(decoded.role)) {
+        isAdmin = true;
+      }
+    } catch (_) {}
+  }
+
+  // Public minimal health check (prevents cross-workspace metadata leakage)
+  if (!isAdmin) {
+    return res.json({
+      status: isReady ? "ok" : "degraded",
+      serverTime: new Date().toISOString()
+    });
+  }
+
+  // Protected detailed diagnostics for authenticated administrators only
+  let dbStatus = isReady ? "connected" : "disconnected";
   let stats = { users: 0, workspaces: 0 };
   const dualStatus = databaseManager.getStatus();
   
-  if (databaseManager.isReady()) {
+  if (isReady) {
     try {
       stats.users = (db.prepare("SELECT COUNT(*) as count FROM users").get() as any)?.count || 0;
       stats.workspaces = (db.prepare("SELECT COUNT(*) as count FROM workspaces").get() as any)?.count || 0;
@@ -244,7 +227,7 @@ app.get("/api/health", (req, res) => {
   }
 
   res.json({
-    status: databaseManager.isReady() ? "ok" : "degraded",
+    status: isReady ? "ok" : "degraded",
     database: dbStatus,
     activeEngine: dualStatus.activeEngine,
     effectiveEngine: dualStatus.effectiveEngine,
@@ -289,9 +272,6 @@ function getWorkspaceUsersFilter(
   viewerAdminId?: number | null
 ): { clause: string; params: any[] } {
   if (currentRole === "SuperAdmin") {
-    if (workspaceId !== undefined && workspaceId !== null && Number(workspaceId) > 0) {
-      return { clause: `${alias}.workspace_id = ?`, params: [Number(workspaceId)] };
-    }
     return { clause: "1=1", params: [] };
   }
   if (currentRole === "Bootstrap") {
@@ -299,9 +279,25 @@ function getWorkspaceUsersFilter(
   }
 
   const wsId = workspaceId || 1;
+  const adminId = viewerAdminId || 0;
+
+  const clause = `(
+    EXISTS (SELECT 1 FROM workspaces ws WHERE ws.id = ? AND ws.created_by = ${alias}.id)
+    OR (
+      ${alias}.id NOT IN (SELECT created_by FROM workspaces WHERE created_by IS NOT NULL AND id != ?)
+      AND (
+        ${alias}.workspace_id = ?
+        OR ${alias}.created_by = ?
+        OR EXISTS (SELECT 1 FROM workspaces ws WHERE ws.id = ? AND ws.created_by = ${alias}.created_by)
+        OR EXISTS (SELECT 1 FROM users p WHERE p.id = ${alias}.created_by AND p.workspace_id = ?)
+        OR ${alias}.id = ?
+      )
+    )
+  )`;
+
   return {
-    clause: `${alias}.workspace_id = ?`,
-    params: [wsId]
+    clause,
+    params: [wsId, wsId, wsId, adminId, wsId, wsId, adminId]
   };
 }
 
@@ -322,8 +318,7 @@ function authenticateToken(req: AuthenticatedRequest, res: Response, next: NextF
     const token = authHeader && authHeader.split(" ")[1];
 
     if (!token) {
-      console.log("Auth failed: Missing token");
-      return res.status(401).json({ error: "Access token is required" });
+      return res.status(401).json({ error: "Access token is required", code: "TOKEN_REQUIRED" });
     }
 
     jwt.verify(token, JWT_SECRET, (err, user: any) => {
@@ -345,9 +340,9 @@ function authenticateToken(req: AuthenticatedRequest, res: Response, next: NextF
           });
         }
 
-        let dbUser = db.prepare("SELECT id, role, workspace_id, full_name, phone_number, status, hourly_rate, monthly_base_salary FROM users WHERE id = ?").get(user.id) as any;
+        let dbUser = db.prepare("SELECT id, role, workspace_id, full_name, phone_number, status, is_active, custom_permissions FROM users WHERE id = ?").get(user.id) as any;
         if (!dbUser && user.phone_number) {
-          dbUser = db.prepare("SELECT id, role, workspace_id, full_name, phone_number, status, hourly_rate, monthly_base_salary FROM users WHERE phone_number = ?").get(user.phone_number) as any;
+          dbUser = db.prepare("SELECT id, role, workspace_id, full_name, phone_number, status, is_active, custom_permissions FROM users WHERE phone_number = ?").get(user.phone_number) as any;
         }
 
         if (!dbUser) {
@@ -355,24 +350,27 @@ function authenticateToken(req: AuthenticatedRequest, res: Response, next: NextF
           return res.status(401).json({ error: "User session is invalid. Please log in again.", code: "AUTH_USER_NOT_FOUND" });
         }
 
-        if (dbUser.status === "SUSPENDED") {
-          logAuditEvent({
-            workspaceId: dbUser.workspace_id,
-            userId: dbUser.id,
-            actorRole: dbUser.role,
-            action: "UNAUTHORIZED_ACCESS_ATTEMPT",
-            details: `Suspended user ${dbUser.full_name} (${dbUser.phone_number}) attempted API access to ${req.originalUrl}`,
-            outcome: "DENIED",
-            ipAddress: req.ip || (req.headers["x-forwarded-for"] as string) || "127.0.0.1"
-          });
+        if (dbUser.status === "SUSPENDED" || dbUser.is_active === 0) {
           return res.status(403).json({
-            error: "Your account has been suspended. Please contact the administrator.",
+            error: "Your account has been suspended by the Super Administrator. Access denied.",
             code: "ACCOUNT_SUSPENDED"
           });
         }
 
-        const effectiveWorkspaceId = dbUser.workspace_id || user.workspace_id || 1;
+        let effectiveWorkspaceId = dbUser.workspace_id || user.workspace_id || 1;
+        // For SuperAdmin, check if a target workspace override was supplied via x-workspace-id header
+        if (dbUser.role === "SuperAdmin") {
+          const wsHeader = req.headers["x-workspace-id"];
+          if (wsHeader && typeof wsHeader === "string") {
+            const parsedWs = parseInt(wsHeader, 10);
+            if (!isNaN(parsedWs) && parsedWs > 0) {
+              effectiveWorkspaceId = parsedWs;
+            }
+          }
+        }
+
         req.user = { ...user, ...dbUser, workspace_id: effectiveWorkspaceId };
+        console.log(`Auth successful: User ${req.user.full_name} (${req.user.role}) - Workspace: ${effectiveWorkspaceId}`);
         next();
       } catch (dbErr: any) {
         console.error("Auth middleware DB error:", dbErr?.message || dbErr);
@@ -405,9 +403,12 @@ export function broadcastServerEvent(eventType: string, payload: any = {}, targe
   });
 
   sseClients.forEach((client, clientId) => {
-    // If targetWorkspaceId is specified, allow SuperAdmin to receive all events; otherwise filter by workspace
-    if (client.role !== "SuperAdmin" && targetWorkspaceId && client.workspaceId && client.workspaceId !== targetWorkspaceId && client.workspaceId !== -1) {
-      return;
+    // Strict isolation: anonymous listeners cannot receive workspace events, and clients only receive events for their own workspace
+    if (client.role !== "SuperAdmin") {
+      if (!client.workspaceId) return;
+      if (targetWorkspaceId && client.workspaceId !== targetWorkspaceId && client.workspaceId !== -1) {
+        return;
+      }
     }
     try {
       client.res.write(`event: message\ndata: ${data}\n\n`);
@@ -668,6 +669,19 @@ app.post("/api/database/sync", authenticateToken, (req: AuthenticatedRequest, re
 
 app.get("/api/database/export-sql", authenticateToken, (req: AuthenticatedRequest, res: Response) => {
   try {
+    if (req.user?.role !== "SuperAdmin" && req.user?.role !== "Bootstrap") {
+      recordAuditLog({
+        workspaceId: req.user?.workspace_id || null,
+        userId: req.user?.id,
+        actorRole: req.user?.role,
+        action: "UNAUTHORIZED_SQL_EXPORT_ATTEMPT",
+        details: `Non-SuperAdmin ${req.user?.full_name} (${req.user?.role}) attempted to download entire database SQL dump`,
+        ipAddress: getClientIp(req),
+        outcome: "DENIED"
+      });
+      return res.status(403).json({ error: "Access denied. Only Super Administrator can export full database dumps." });
+    }
+
     const sqlDump = databaseManager.generateMysqlDumpSql();
     res.setHeader("Content-Type", "application/sql; charset=utf-8");
     res.setHeader("Content-Disposition", `attachment; filename="buildtrack_ams_dump_${Date.now()}.sql"`);
@@ -732,6 +746,17 @@ app.post("/api/auth/login", (req: Request, res: Response) => {
     });
   }
 
+  // Ensure database is connected before querying
+  if (!databaseManager.isReady()) {
+    databaseManager.tryReconnect();
+    if (!databaseManager.isReady()) {
+      return res.status(503).json({
+        error: "Database service is initializing. Please try again in a few moments.",
+        code: "DATABASE_INITIALIZING"
+      });
+    }
+  }
+
   try {
     const user: any = db.prepare(`
       SELECT u.*, w.name as workspace_name 
@@ -742,58 +767,57 @@ app.post("/api/auth/login", (req: Request, res: Response) => {
 
     if (!user) {
       recordLoginFailure(rateLimitKey);
-      logAuditEvent({
-        workspaceId: 1,
-        actorRole: "Anonymous",
+      recordAuditLog({
+        workspaceId: null,
+        userId: null,
         action: "LOGIN_FAILED",
-        details: `Login failed: user with phone ${phone_number} not found`,
-        outcome: "FAILED",
-        ipAddress: clientIp
+        details: `Failed login attempt: phone number ${phone_number} not found`,
+        ipAddress: clientIp,
+        outcome: "FAILURE"
       });
       return res.status(400).json({ error: "Invalid phone number or password" });
-    }
-
-    if (user.status === "SUSPENDED") {
-      recordLoginFailure(rateLimitKey);
-      logAuditEvent({
-        workspaceId: user.workspace_id || 1,
-        userId: user.id,
-        actorRole: user.role,
-        action: "LOGIN_SUSPENDED",
-        details: `Suspended user ${user.full_name} (${user.phone_number}) attempted login`,
-        outcome: "DENIED",
-        ipAddress: clientIp
-      });
-      return res.status(403).json({
-        error: "Your account has been suspended. Please contact the administrator.",
-        code: "ACCOUNT_SUSPENDED"
-      });
     }
 
     const validPassword = bcrypt.compareSync(password, user.password);
     if (!validPassword) {
       recordLoginFailure(rateLimitKey);
-      logAuditEvent({
-        workspaceId: user.workspace_id || 1,
+      recordAuditLog({
+        workspaceId: user.workspace_id,
         userId: user.id,
         actorRole: user.role,
         action: "LOGIN_FAILED",
-        details: `Invalid password entered for user ${user.full_name} (${user.phone_number})`,
-        outcome: "FAILED",
-        ipAddress: clientIp
+        details: `Failed login attempt: incorrect password for user ${user.full_name} (${user.phone_number})`,
+        ipAddress: clientIp,
+        outcome: "FAILURE"
       });
       return res.status(400).json({ error: "Invalid phone number or password" });
     }
 
+    if (user.status === "SUSPENDED" || user.is_active === 0) {
+      recordAuditLog({
+        workspaceId: user.workspace_id,
+        userId: user.id,
+        actorRole: user.role,
+        action: "SUSPENDED_LOGIN_ATTEMPT",
+        details: `Suspended user ${user.full_name} (${user.phone_number}) attempted to log in`,
+        ipAddress: clientIp,
+        outcome: "DENIED"
+      });
+      return res.status(403).json({
+        error: "Your account has been suspended by the Super Administrator. Access is blocked.",
+        code: "ACCOUNT_SUSPENDED"
+      });
+    }
+
     recordLoginSuccess(rateLimitKey);
-    logAuditEvent({
-      workspaceId: user.workspace_id || 1,
+    recordAuditLog({
+      workspaceId: user.workspace_id,
       userId: user.id,
       actorRole: user.role,
       action: "LOGIN_SUCCESS",
-      details: `User ${user.full_name} (${user.phone_number}, role: ${user.role}) logged in successfully`,
-      outcome: "SUCCESS",
-      ipAddress: clientIp
+      details: `Successful login by ${user.full_name} (${user.role}) from IP ${clientIp}`,
+      ipAddress: clientIp,
+      outcome: "SUCCESS"
     });
 
     const token = jwt.sign(
@@ -814,7 +838,6 @@ app.post("/api/auth/login", (req: Request, res: Response) => {
         registration_date: user.registration_date,
         workspace_id: user.workspace_id,
         workspace_name: user.workspace_name,
-        status: user.status || "ACTIVE"
       },
     });
   } catch (error: any) {
@@ -994,19 +1017,6 @@ app.post("/api/employees/register", authenticateToken, (req: AuthenticatedReques
   const employeeRoles = ["Employee", "Purchaser", "Accountant", "Engineer", "HR"];
 
   // Role hierarchy and registration permissions:
-  if (role === "SuperAdmin" && currentRole !== "SuperAdmin") {
-    logAuditEvent({
-      workspaceId: currentWorkspaceId,
-      userId: req.user?.id,
-      actorRole: currentRole,
-      action: "PRIVILEGE_ESCALATION_ATTEMPT",
-      details: `${req.user?.full_name} (${currentRole}) attempted to register an unauthorized SuperAdmin account`,
-      outcome: "DENIED",
-      ipAddress: req.ip || "127.0.0.1"
-    });
-    return res.status(403).json({ error: "Access denied. Only Super Administrators can grant Super Admin privileges." });
-  }
-
   // 1. Bootstrap can ONLY register other Admin accounts (specifically AdminCreator). Cannot register Employees, AdminManagers or SuperAdmins.
   if (currentRole === "Bootstrap") {
     if (role !== "AdminCreator") {
@@ -1014,11 +1024,11 @@ app.post("/api/employees/register", authenticateToken, (req: AuthenticatedReques
     }
   }
 
-  // 2. AdminCreator can register other Admin accounts or Employees within their authorized workspace.
+  // 2. AdminCreator can register other Admin accounts or Employees.
   // 3. AdminManager can ONLY register employee roles, CANNOT create other Admins.
   if (currentRole === "AdminManager") {
     if (!employeeRoles.includes(role)) {
-      return res.status(403).json({ error: "Managing Admin can only register employee roles (Employee, Purchaser, Accountant, Engineer, HR)." });
+      return res.status(400).json({ error: "Second Workspace Managing Admin can only register employee roles (Employee, Purchaser, Accountant, Engineer, HR)." });
     }
   }
 
@@ -1033,46 +1043,69 @@ app.post("/api/employees/register", authenticateToken, (req: AuthenticatedReques
     const rateValue = parseFloat(hourly_rate) > 0 ? parseFloat(hourly_rate) : 150.0;
     const monthlySalary = parseFloat(monthly_base_salary) > 0 ? parseFloat(monthly_base_salary) : 0.0;
 
-    let targetWorkspaceId: number = currentWorkspaceId || 1;
+    let targetWorkspaceId: number | null = null;
 
-    if (currentRole === "SuperAdmin") {
-      if (req.body.workspace_id && Number(req.body.workspace_id) > 0) {
-        targetWorkspaceId = Number(req.body.workspace_id);
+    if (employeeRoles.includes(role)) {
+      targetWorkspaceId = currentWorkspaceId || 1;
+      const wsCheck = db.prepare("SELECT id FROM workspaces WHERE id = ?").get(targetWorkspaceId);
+      if (!wsCheck) {
+        const firstWs: any = db.prepare("SELECT id FROM workspaces ORDER BY id ASC LIMIT 1").get();
+        targetWorkspaceId = firstWs ? firstWs.id : 1;
       }
     } else {
-      // Non-SuperAdmin is strictly locked to their own authorized workspace
-      targetWorkspaceId = currentWorkspaceId || 1;
+      // It's a newly registered Admin
+      if (role === "AdminCreator") {
+        const wName = workspace_name || `Workspace for ${full_name}`;
+        
+        let cleanName = wName;
+        const existsCheck = db.prepare("SELECT id FROM workspaces WHERE name = ?").get(cleanName);
+        if (existsCheck) {
+          cleanName = `${wName} (${Math.floor(Math.random()*1000)})`;
+        }
+
+        const wResult = db.prepare("INSERT INTO workspaces (name, created_by) VALUES (?, ?)").run(cleanName, req.user?.id || null);
+        targetWorkspaceId = Number(wResult.lastInsertRowid);
+
+        // Seed site settings for the new workspace!
+        db.prepare(`
+          INSERT INTO site_settings (office_name, latitude, longitude, wifi_ssid, wifi_ip, use_wifi_verification, workspace_id)
+          VALUES (?, ?, ?, ?, ?, ?, ?)
+        `).run(cleanName, 9.0227, 38.7460, 'Apex_HQ_WiFi', '192.168.1.100', 1, targetWorkspaceId);
+
+        // Seed static office QR code for the new workspace
+        getActiveOfficeQr(targetWorkspaceId);
+      } else {
+        // AdminManager or other admin without own workspace: assigned to current workspace
+        targetWorkspaceId = currentWorkspaceId || 1;
+      }
     }
 
-    const workspaceExists = db.prepare("SELECT id FROM workspaces WHERE id = ?").get(targetWorkspaceId);
-    if (!workspaceExists) {
-      return res.status(400).json({ error: "Assigned workspace does not exist." });
+    if (targetWorkspaceId !== null) {
+      const workspaceExists = db.prepare("SELECT id FROM workspaces WHERE id = ?").get(targetWorkspaceId);
+      if (!workspaceExists) {
+        return res.status(400).json({ error: "Assigned workspace no longer exists. Please contact support." });
+      }
     }
 
     const result = db.prepare(`
-      INSERT INTO users (full_name, phone_number, role, password, photo, hourly_rate, monthly_base_salary, workspace_id, created_by, status)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE')
+      INSERT INTO users (full_name, phone_number, role, password, photo, hourly_rate, monthly_base_salary, workspace_id, created_by)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(full_name, phone_number, role, passwordHash, photo || null, rateValue, monthlySalary, targetWorkspaceId, req.user?.id || null);
 
     const userId = Number(result.lastInsertRowid);
+
+    // If an AdminCreator created a new workspace, record them as the creator of that workspace
+    if (role === "AdminCreator" && targetWorkspaceId) {
+      try {
+        db.prepare("UPDATE workspaces SET created_by = ? WHERE id = ?").run(userId, targetWorkspaceId);
+      } catch (_) {}
+    }
 
     // Initialize attendance score
     db.prepare(`
       INSERT INTO attendance_scores (user_id, attendance_score, punctuality_percentage, late_count)
       VALUES (?, 0.0, 0.0, 0)
     `).run(userId);
-
-    logAuditEvent({
-      workspaceId: targetWorkspaceId,
-      userId: req.user?.id,
-      actorRole: currentRole,
-      action: "EMPLOYEE_REGISTERED",
-      details: `${req.user?.full_name} (${currentRole}) registered ${role} "${full_name}" (${phone_number}) in workspace #${targetWorkspaceId}`,
-      targetId: userId,
-      targetType: "user",
-      outcome: "SUCCESS",
-      ipAddress: req.ip || "127.0.0.1"
-    });
 
     const responsePayload = {
       success: true,
@@ -1118,27 +1151,14 @@ app.get("/api/employees", authenticateToken, (req: AuthenticatedRequest, res: Re
   try {
     let rawEmployees: any[];
     if (currentRole === "SuperAdmin") {
-      const filterWs = req.query.workspace_id;
-      if (filterWs && filterWs !== "all" && Number(filterWs) > 0) {
-        rawEmployees = db.prepare(`
-          SELECT u.id, u.full_name, u.phone_number, u.role, u.photo, u.hourly_rate, u.monthly_base_salary,
-                 u.salary_calculation_mode, u.department, u.registration_date, w.name as workspace_name, u.workspace_id,
-                 u.registered_device_id, u.device_name, u.device_registered_at, u.device_status
-          FROM users u
-          LEFT JOIN workspaces w ON u.workspace_id = w.id
-          WHERE u.workspace_id = ?
-          ORDER BY u.role DESC, u.full_name ASC
-        `).all(Number(filterWs));
-      } else {
-        rawEmployees = db.prepare(`
-          SELECT u.id, u.full_name, u.phone_number, u.role, u.photo, u.hourly_rate, u.monthly_base_salary,
-                 u.salary_calculation_mode, u.department, u.registration_date, w.name as workspace_name, u.workspace_id,
-                 u.registered_device_id, u.device_name, u.device_registered_at, u.device_status
-          FROM users u
-          LEFT JOIN workspaces w ON u.workspace_id = w.id
-          ORDER BY u.role DESC, u.full_name ASC
-        `).all();
-      }
+      rawEmployees = db.prepare(`
+        SELECT u.id, u.full_name, u.phone_number, u.role, u.photo, u.hourly_rate, u.monthly_base_salary,
+               u.salary_calculation_mode, u.department, u.registration_date, w.name as workspace_name, u.workspace_id,
+               u.registered_device_id, u.device_name, u.device_registered_at, u.device_status
+        FROM users u
+        LEFT JOIN workspaces w ON u.workspace_id = w.id
+        ORDER BY u.role DESC, u.full_name ASC
+      `).all();
     } else if (currentRole === "Bootstrap") {
       rawEmployees = db.prepare(`
         SELECT u.id, u.full_name, u.phone_number, u.role, u.photo, u.hourly_rate, u.monthly_base_salary,
@@ -1268,25 +1288,8 @@ app.put("/api/employees/:id", authenticateToken, (req: AuthenticatedRequest, res
       return res.status(403).json({ error: "Access denied. Data isolation violation." });
     }
 
-    if (role === "SuperAdmin" && currentRole !== "SuperAdmin") {
-      logAuditEvent({
-        workspaceId: currentWorkspaceId,
-        userId: req.user?.id,
-        actorRole: currentRole,
-        action: "PRIVILEGE_ESCALATION_ATTEMPT",
-        details: `${req.user?.full_name} (${currentRole}) attempted to escalate user #${id} to SuperAdmin`,
-        outcome: "DENIED",
-        ipAddress: req.ip || "127.0.0.1"
-      });
-      return res.status(403).json({ error: "Access denied. Only Super Administrators can assign SuperAdmin role." });
-    }
-
-    if (employee.role === "SuperAdmin" && currentRole !== "SuperAdmin") {
-      return res.status(403).json({ error: "Access denied. Only Super Administrators can modify SuperAdmin accounts." });
-    }
-
     if (currentRole === "AdminManager" && !employeeRoles.includes(employee.role)) {
-      return res.status(403).json({ error: "Access denied. Managing Admin cannot modify other Admin accounts." });
+      return res.status(403).json({ error: "Access denied. Second Workspace Managing Admin cannot modify other Admin accounts." });
     }
 
     // Check if phone number is taken by another user
@@ -1311,18 +1314,6 @@ app.put("/api/employees/:id", authenticateToken, (req: AuthenticatedRequest, res
         WHERE id = ?
       `).run(full_name, phone_number, role, rateValue, id);
     }
-
-    logAuditEvent({
-      workspaceId: employee.workspace_id || currentWorkspaceId || 1,
-      userId: req.user?.id,
-      actorRole: currentRole,
-      action: "EMPLOYEE_UPDATED",
-      details: `Updated employee #${id} (${full_name}, role: ${role})`,
-      targetId: parseInt(id),
-      targetType: "user",
-      outcome: "SUCCESS",
-      ipAddress: req.ip || "127.0.0.1"
-    });
 
     // Realtime broadcast employee changes
     const targetWs = employee.workspace_id || currentWorkspaceId || 1;
@@ -1355,7 +1346,7 @@ app.delete("/api/employees/:id", authenticateToken, (req: AuthenticatedRequest, 
   const employeeRoles = ["Employee", "Purchaser", "Accountant", "Engineer", "HR"];
 
   try {
-    const employee: any = db.prepare("SELECT role, workspace_id, full_name FROM users WHERE id = ?").get(id);
+    const employee: any = db.prepare("SELECT role, workspace_id FROM users WHERE id = ?").get(id);
     if (!employee) {
       return res.status(404).json({ error: "Employee not found." });
     }
@@ -1363,27 +1354,11 @@ app.delete("/api/employees/:id", authenticateToken, (req: AuthenticatedRequest, 
       return res.status(403).json({ error: "Access denied. Data isolation violation." });
     }
 
-    if (currentRole !== "SuperAdmin" && ["SuperAdmin", "AdminCreator", "AdminManager", "Admin"].includes(employee.role)) {
-      return res.status(403).json({ error: "Access denied. Workspace administrators cannot delete other administrators." });
-    }
-
     if (currentRole === "AdminManager" && !employeeRoles.includes(employee.role)) {
-      return res.status(403).json({ error: "Access denied. Managing Admin cannot delete other Admin accounts." });
+      return res.status(403).json({ error: "Access denied. Second Workspace Managing Admin cannot delete other Admin accounts." });
     }
 
     db.prepare("DELETE FROM users WHERE id = ?").run(id);
-
-    logAuditEvent({
-      workspaceId: employee.workspace_id || currentWorkspaceId || 1,
-      userId: req.user?.id,
-      actorRole: currentRole,
-      action: "EMPLOYEE_DELETED",
-      details: `Deleted employee #${id} (${employee.full_name}, ${employee.role})`,
-      targetId: parseInt(id),
-      targetType: "user",
-      outcome: "SUCCESS",
-      ipAddress: req.ip || "127.0.0.1"
-    });
 
     // Realtime broadcast employee deletion
     const targetWs = employee.workspace_id || currentWorkspaceId || 1;
@@ -1422,9 +1397,6 @@ app.put("/api/employees/:id/hourly-rate", authenticateToken, (req: Authenticated
     if (currentRole !== "SuperAdmin" && currentRole !== "Bootstrap" && employee.workspace_id !== currentWorkspaceId) {
       return res.status(403).json({ error: "Access denied. Data isolation violation." });
     }
-    if (parseInt(id, 10) === req.user?.id && currentRole !== "SuperAdmin") {
-      return res.status(403).json({ error: "Access denied. Administrators cannot modify their own hourly rate." });
-    }
 
     db.prepare("UPDATE users SET hourly_rate = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(parseFloat(hourly_rate), id);
     broadcastServerEvent("SALARY_CHANGED", { userId: parseInt(id), hourly_rate: parseFloat(hourly_rate) }, employee.workspace_id || 1);
@@ -1434,616 +1406,22 @@ app.put("/api/employees/:id/hourly-rate", authenticateToken, (req: Authenticated
   }
 });
 
-// --- WORKSPACE & MULTI-TENANT MANAGEMENT API ---
+// Mount Super Administrator Central Management Router (Strictly SuperAdmin-only)
+app.use("/api/super-admin", authenticateToken, superAdminRouter);
 
-// Fetch workspaces list (SuperAdmin sees all with stats; others see only their assigned workspace)
+// Fetch workspaces list (SuperAdmin sees all; Workspace Admin sees only authorized workspace)
 app.get("/api/workspaces", authenticateToken, (req: AuthenticatedRequest, res: Response) => {
   try {
-    const isSuper = isSuperAdmin(req.user);
-    let list: any[];
-    if (isSuper) {
-      list = db.prepare(`
-        SELECT w.*,
-          (SELECT COUNT(*) FROM users u WHERE u.workspace_id = w.id AND u.role NOT IN ('SuperAdmin', 'Bootstrap')) as employee_count,
-          (SELECT COUNT(*) FROM users u WHERE u.workspace_id = w.id AND u.role IN ('AdminCreator', 'AdminManager', 'Admin', 'HR', 'Accountant')) as admin_count
-        FROM workspaces w
-        ORDER BY w.id ASC
-      `).all();
-    } else {
-      const userWs = req.user?.workspace_id || 1;
-      list = db.prepare(`
-        SELECT w.*,
-          (SELECT COUNT(*) FROM users u WHERE u.workspace_id = w.id AND u.role NOT IN ('SuperAdmin', 'Bootstrap')) as employee_count,
-          (SELECT COUNT(*) FROM users u WHERE u.workspace_id = w.id AND u.role IN ('AdminCreator', 'AdminManager', 'Admin', 'HR', 'Accountant')) as admin_count
-        FROM workspaces w
-        WHERE w.id = ?
-      `).all(userWs);
+    const userRole = req.user?.role;
+    const userWsId = req.user?.workspace_id;
+    if (userRole === "SuperAdmin") {
+      const list = db.prepare("SELECT * FROM workspaces ORDER BY name ASC").all();
+      return res.json(list);
     }
+    const list = db.prepare("SELECT * FROM workspaces WHERE id = ? ORDER BY name ASC").all(userWsId || 1);
     res.json(list);
   } catch (err) {
-    console.error("Fetch workspaces error:", err);
     res.status(500).json({ error: "Internal server error" });
-  }
-});
-
-// Create new Workspace (SuperAdmin only)
-app.post("/api/workspaces", authenticateToken, requireSuperAdmin, (req: AuthenticatedRequest, res: Response) => {
-  const { name, description, office_name, latitude, longitude, wifi_ssid, wifi_ip } = req.body;
-  if (!name || typeof name !== "string" || !name.trim()) {
-    return res.status(400).json({ error: "Workspace name is required" });
-  }
-
-  const cleanName = name.trim();
-  try {
-    const existing = db.prepare("SELECT id FROM workspaces WHERE name = ?").get(cleanName);
-    if (existing) {
-      return res.status(400).json({ error: "A workspace with this name already exists" });
-    }
-
-    const result = db.prepare(`
-      INSERT INTO workspaces (name, created_by, status, description)
-      VALUES (?, ?, 'ACTIVE', ?)
-    `).run(cleanName, req.user?.id, description ? String(description).trim() : "");
-
-    const newWsId = Number(result.lastInsertRowid);
-
-    // 1. Seed site settings
-    const officeNameVal = office_name ? String(office_name).trim() : cleanName;
-    const latVal = latitude ? parseFloat(latitude) : 9.0227;
-    const lonVal = longitude ? parseFloat(longitude) : 38.7460;
-    const ssidVal = wifi_ssid ? String(wifi_ssid).trim() : "Office_WiFi";
-    const ipVal = wifi_ip ? String(wifi_ip).trim() : "";
-
-    db.prepare(`
-      INSERT INTO site_settings (
-        office_name, latitude, longitude, office_wifi_ssid, office_wifi_bssid,
-        wifi_ssid, wifi_ip, use_wifi_verification, workspace_id
-      ) VALUES (?, ?, ?, ?, '00:11:22:33:44:55', ?, ?, 1, ?)
-    `).run(officeNameVal, latVal, lonVal, ssidVal, ssidVal, ipVal, newWsId);
-
-    // 2. Seed active office QR code
-    getActiveOfficeQr(newWsId);
-
-    // 3. Seed default 7-day schedule
-    const defaultSchedules = [
-      { day: 0, name: "Sunday", morning: "NON_WORKING", afternoon: "NON_WORKING" },
-      { day: 1, name: "Monday", morning: "WORKING", afternoon: "WORKING" },
-      { day: 2, name: "Tuesday", morning: "WORKING", afternoon: "WORKING" },
-      { day: 3, name: "Wednesday", morning: "WORKING", afternoon: "WORKING" },
-      { day: 4, name: "Thursday", morning: "WORKING", afternoon: "WORKING" },
-      { day: 5, name: "Friday", morning: "WORKING", afternoon: "WORKING" },
-      { day: 6, name: "Saturday", morning: "WORKING", afternoon: "NON_WORKING" }
-    ];
-    const insertSchedule = db.prepare(`
-      INSERT INTO work_schedules (workspace_id, day_of_week, day_name, morning_status, afternoon_status, morning_start, morning_end, afternoon_start, afternoon_end)
-      VALUES (?, ?, ?, ?, ?, '02:00', '06:00', '07:00', '11:00')
-    `);
-    for (const s of defaultSchedules) {
-      insertSchedule.run(newWsId, s.day, s.name, s.morning, s.afternoon);
-    }
-
-    // 4. Seed default holidays
-    const defaultHolidays = [
-      { date: "2026-09-11", name: "Enkutatash (Ethiopian New Year)", type: "PUBLIC" },
-      { date: "2026-09-27", name: "Meskel (Finding of True Cross)", type: "PUBLIC" },
-      { date: "2027-01-07", name: "Genna (Ethiopian Christmas)", type: "PUBLIC" },
-      { date: "2027-01-19", name: "Timkat (Epiphany)", type: "PUBLIC" },
-      { date: "2027-03-02", name: "Victory of Adwa Day", type: "PUBLIC" },
-      { date: "2027-05-01", name: "International Workers' Day", type: "PUBLIC" },
-      { date: "2027-05-05", name: "Patriots' Victory Day", type: "PUBLIC" }
-    ];
-    const insertHoliday = db.prepare(`
-      INSERT INTO holidays (workspace_id, date, name, type, duration, is_active)
-      VALUES (?, ?, ?, ?, 'FULL_DAY', 1)
-    `);
-    for (const h of defaultHolidays) {
-      insertHoliday.run(newWsId, h.date, h.name, h.type);
-    }
-
-    logAuditEvent({
-      workspaceId: newWsId,
-      userId: req.user?.id,
-      actorRole: req.user?.role,
-      action: "WORKSPACE_CREATED",
-      details: `Created new workspace "${cleanName}" (#${newWsId})`,
-      targetId: newWsId,
-      targetType: "workspace",
-      outcome: "SUCCESS",
-      ipAddress: req.ip || "127.0.0.1"
-    });
-
-    const createdWs = db.prepare("SELECT * FROM workspaces WHERE id = ?").get(newWsId);
-    broadcastServerEvent("WORKSPACES_CHANGED", { workspaceId: newWsId, action: "created" });
-
-    res.json({ success: true, workspace: createdWs });
-  } catch (err: any) {
-    console.error("Create workspace error:", err);
-    res.status(500).json({ error: "Failed to create workspace: " + (err?.message || "Internal error") });
-  }
-});
-
-// Update Workspace (SuperAdmin only)
-app.put("/api/workspaces/:id", authenticateToken, requireSuperAdmin, (req: AuthenticatedRequest, res: Response) => {
-  const wsId = parseInt(req.params.id, 10);
-  const { name, status, description } = req.body;
-
-  try {
-    const existing: any = db.prepare("SELECT * FROM workspaces WHERE id = ?").get(wsId);
-    if (!existing) {
-      return res.status(404).json({ error: "Workspace not found" });
-    }
-
-    const newName = name && typeof name === "string" ? name.trim() : existing.name;
-    const newStatus = status && ["ACTIVE", "INACTIVE"].includes(status) ? status : (existing.status || "ACTIVE");
-    const newDesc = description !== undefined ? String(description).trim() : (existing.description || "");
-
-    db.prepare(`
-      UPDATE workspaces 
-      SET name = ?, status = ?, description = ?
-      WHERE id = ?
-    `).run(newName, newStatus, newDesc, wsId);
-
-    logAuditEvent({
-      workspaceId: wsId,
-      userId: req.user?.id,
-      actorRole: req.user?.role,
-      action: "WORKSPACE_UPDATED",
-      details: `Updated workspace #${wsId} (${newName}, status: ${newStatus})`,
-      targetId: wsId,
-      targetType: "workspace",
-      outcome: "SUCCESS",
-      ipAddress: req.ip || "127.0.0.1"
-    });
-
-    broadcastServerEvent("WORKSPACES_CHANGED", { workspaceId: wsId, action: "updated" });
-    res.json({ success: true });
-  } catch (err: any) {
-    console.error("Update workspace error:", err);
-    res.status(500).json({ error: "Failed to update workspace" });
-  }
-});
-
-// Deactivate / Soft Delete Workspace (SuperAdmin only)
-app.delete("/api/workspaces/:id", authenticateToken, requireSuperAdmin, (req: AuthenticatedRequest, res: Response) => {
-  const wsId = parseInt(req.params.id, 10);
-  if (wsId === 1) {
-    return res.status(400).json({ error: "Primary headquarters workspace (#1) cannot be deactivated or deleted." });
-  }
-
-  try {
-    const existing: any = db.prepare("SELECT * FROM workspaces WHERE id = ?").get(wsId);
-    if (!existing) {
-      return res.status(404).json({ error: "Workspace not found" });
-    }
-
-    db.prepare("UPDATE workspaces SET status = 'INACTIVE' WHERE id = ?").run(wsId);
-
-    logAuditEvent({
-      workspaceId: wsId,
-      userId: req.user?.id,
-      actorRole: req.user?.role,
-      action: "WORKSPACE_DEACTIVATED",
-      details: `Deactivated workspace #${wsId} (${existing.name})`,
-      targetId: wsId,
-      targetType: "workspace",
-      outcome: "SUCCESS",
-      ipAddress: req.ip || "127.0.0.1"
-    });
-
-    broadcastServerEvent("WORKSPACES_CHANGED", { workspaceId: wsId, action: "deactivated" });
-    res.json({ success: true, message: `Workspace "${existing.name}" deactivated.` });
-  } catch (err: any) {
-    console.error("Deactivate workspace error:", err);
-    res.status(500).json({ error: "Failed to deactivate workspace" });
-  }
-});
-
-// --- SUPER ADMIN MANAGEMENT & AUDIT API ---
-
-// Global SuperAdmin Stats Overview
-app.get("/api/superadmin/stats", authenticateToken, requireSuperAdmin, (req: AuthenticatedRequest, res: Response) => {
-  try {
-    const totalWorkspaces = (db.prepare("SELECT COUNT(*) as c FROM workspaces WHERE status != 'INACTIVE' OR status IS NULL").get() as any)?.c || 0;
-    const totalAdmins = (db.prepare("SELECT COUNT(*) as c FROM users WHERE role IN ('SuperAdmin', 'AdminCreator', 'AdminManager', 'Admin', 'HR', 'Accountant')").get() as any)?.c || 0;
-    const totalEmployees = (db.prepare("SELECT COUNT(*) as c FROM users WHERE role NOT IN ('SuperAdmin', 'Bootstrap')").get() as any)?.c || 0;
-    
-    const todayStr = getEthiopianDateString();
-    const todayCheckins = (db.prepare("SELECT COUNT(*) as c FROM attendance WHERE date = ?").get(todayStr) as any)?.c || 0;
-    const pendingRequests = (db.prepare("SELECT COUNT(*) as c FROM permissions WHERE status = 'Pending'").get() as any)?.c || 0;
-    const pendingCorrections = (db.prepare("SELECT COUNT(*) as c FROM attendance WHERE status = 'Missing Checkout' AND (correction_status != 'CORRECTED' OR correction_status IS NULL)").get() as any)?.c || 0;
-    const securityAlertsCount = (db.prepare("SELECT COUNT(*) as c FROM audit_logs WHERE outcome = 'DENIED' OR action LIKE '%VIOLATION%' OR action LIKE '%FAILED%'").get() as any)?.c || 0;
-
-    res.json({
-      totalWorkspaces,
-      totalAdmins,
-      totalEmployees,
-      todayCheckins,
-      pendingRequests,
-      pendingCorrections,
-      securityAlertsCount
-    });
-  } catch (err) {
-    console.error("SuperAdmin stats error:", err);
-    res.status(500).json({ error: "Failed to load SuperAdmin stats" });
-  }
-});
-
-// List all administrators across all workspaces (SuperAdmin only)
-app.get("/api/superadmin/admins", authenticateToken, requireSuperAdmin, (req: AuthenticatedRequest, res: Response) => {
-  try {
-    const admins = db.prepare(`
-      SELECT u.id, u.full_name, u.phone_number, u.role, u.status, u.workspace_id,
-             w.name as workspace_name, u.registration_date, u.hourly_rate, u.monthly_base_salary,
-             u.registered_device_id, u.device_name, u.device_status
-      FROM users u
-      LEFT JOIN workspaces w ON u.workspace_id = w.id
-      WHERE u.role IN ('SuperAdmin', 'AdminCreator', 'AdminManager', 'Admin', 'HR', 'Accountant', 'Bootstrap')
-      ORDER BY u.role ASC, u.full_name ASC
-    `).all();
-
-    res.json(admins);
-  } catch (err) {
-    console.error("SuperAdmin admins fetch error:", err);
-    res.status(500).json({ error: "Failed to fetch administrators" });
-  }
-});
-
-// Create new administrator (SuperAdmin only)
-app.post("/api/superadmin/admins", authenticateToken, requireSuperAdmin, (req: AuthenticatedRequest, res: Response) => {
-  const { full_name, phone_number, role, password, workspace_id, hourly_rate, monthly_base_salary } = req.body;
-  if (!full_name || !phone_number || !role || !password) {
-    return res.status(400).json({ error: "Full name, phone number, role, and password are required" });
-  }
-
-  const validAdminRoles = ["SuperAdmin", "AdminCreator", "AdminManager", "Admin", "HR", "Accountant"];
-  if (!validAdminRoles.includes(role)) {
-    return res.status(400).json({ error: "Invalid administrator role specified" });
-  }
-
-  try {
-    const existing = db.prepare("SELECT id FROM users WHERE phone_number = ?").get(phone_number);
-    if (existing) {
-      return res.status(400).json({ error: "A user with this phone number is already registered" });
-    }
-
-    const targetWsId = role === "SuperAdmin" ? (workspace_id || 1) : (workspace_id || 1);
-    const passwordHash = bcrypt.hashSync(password, 10);
-    const rateVal = parseFloat(hourly_rate) > 0 ? parseFloat(hourly_rate) : 150.0;
-    const monthlyVal = parseFloat(monthly_base_salary) > 0 ? parseFloat(monthly_base_salary) : 0.0;
-
-    const result = db.prepare(`
-      INSERT INTO users (
-        full_name, phone_number, role, password, hourly_rate, monthly_base_salary,
-        workspace_id, created_by, status
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE')
-    `).run(full_name, phone_number, role, passwordHash, rateVal, monthlyVal, targetWsId, req.user?.id);
-
-    const newId = Number(result.lastInsertRowid);
-
-    try {
-      db.prepare(`
-        INSERT INTO attendance_scores (user_id, attendance_score, punctuality_percentage, late_count)
-        VALUES (?, 0.0, 0.0, 0)
-      `).run(newId);
-    } catch (_) {}
-
-    logAuditEvent({
-      workspaceId: targetWsId,
-      userId: req.user?.id,
-      actorRole: req.user?.role,
-      action: "ADMIN_CREATED",
-      details: `SuperAdmin created ${role} account for "${full_name}" (${phone_number}) assigned to workspace #${targetWsId}`,
-      targetId: newId,
-      targetType: "user",
-      outcome: "SUCCESS",
-      ipAddress: req.ip || "127.0.0.1"
-    });
-
-    broadcastServerEvent("EMPLOYEES_CHANGED", { workspaceId: targetWsId, action: "admin_created", userId: newId });
-
-    res.json({ success: true, id: newId });
-  } catch (err: any) {
-    console.error("SuperAdmin create admin error:", err);
-    res.status(500).json({ error: "Failed to create administrator: " + (err?.message || "Internal error") });
-  }
-});
-
-// Update administrator details (SuperAdmin only)
-app.put("/api/superadmin/admins/:id", authenticateToken, requireSuperAdmin, (req: AuthenticatedRequest, res: Response) => {
-  const adminId = parseInt(req.params.id, 10);
-  const { full_name, phone_number, role, workspace_id, hourly_rate, monthly_base_salary, password } = req.body;
-
-  try {
-    const existing: any = db.prepare("SELECT * FROM users WHERE id = ?").get(adminId);
-    if (!existing) {
-      return res.status(404).json({ error: "Administrator not found" });
-    }
-
-    if (phone_number && phone_number !== existing.phone_number) {
-      const phoneTaken = db.prepare("SELECT id FROM users WHERE phone_number = ? AND id != ?").get(phone_number, adminId);
-      if (phoneTaken) {
-        return res.status(400).json({ error: "Phone number is already in use by another user" });
-      }
-    }
-
-    const newName = full_name ? String(full_name).trim() : existing.full_name;
-    const newPhone = phone_number ? String(phone_number).trim() : existing.phone_number;
-    const newRole = role || existing.role;
-    const newWsId = workspace_id !== undefined ? Number(workspace_id) : existing.workspace_id;
-    const newRate = hourly_rate !== undefined ? parseFloat(hourly_rate) : existing.hourly_rate;
-    const newMonthly = monthly_base_salary !== undefined ? parseFloat(monthly_base_salary) : existing.monthly_base_salary;
-
-    if (password && String(password).trim().length > 0) {
-      const pwHash = bcrypt.hashSync(String(password).trim(), 10);
-      db.prepare(`
-        UPDATE users 
-        SET full_name = ?, phone_number = ?, role = ?, workspace_id = ?, hourly_rate = ?, monthly_base_salary = ?, password = ?, updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?
-      `).run(newName, newPhone, newRole, newWsId, newRate, newMonthly, pwHash, adminId);
-    } else {
-      db.prepare(`
-        UPDATE users 
-        SET full_name = ?, phone_number = ?, role = ?, workspace_id = ?, hourly_rate = ?, monthly_base_salary = ?, updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?
-      `).run(newName, newPhone, newRole, newWsId, newRate, newMonthly, adminId);
-    }
-
-    logAuditEvent({
-      workspaceId: newWsId,
-      userId: req.user?.id,
-      actorRole: req.user?.role,
-      action: "ADMIN_UPDATED",
-      details: `Updated administrator #${adminId} (${newName}, role: ${newRole}, workspace: #${newWsId})`,
-      targetId: adminId,
-      targetType: "user",
-      outcome: "SUCCESS",
-      ipAddress: req.ip || "127.0.0.1"
-    });
-
-    broadcastServerEvent("EMPLOYEES_CHANGED", { workspaceId: newWsId, action: "admin_updated", userId: adminId });
-    res.json({ success: true });
-  } catch (err: any) {
-    console.error("SuperAdmin update admin error:", err);
-    res.status(500).json({ error: "Failed to update administrator" });
-  }
-});
-
-// Suspend or Reactivate Administrator access (SuperAdmin only)
-app.post("/api/superadmin/admins/:id/status", authenticateToken, requireSuperAdmin, (req: AuthenticatedRequest, res: Response) => {
-  const adminId = parseInt(req.params.id, 10);
-  const { status, reason } = req.body;
-
-  if (adminId === req.user?.id) {
-    return res.status(400).json({ error: "You cannot change the status of your own Super Admin account." });
-  }
-
-  if (!status || !["ACTIVE", "SUSPENDED"].includes(status)) {
-    return res.status(400).json({ error: "Status must be 'ACTIVE' or 'SUSPENDED'" });
-  }
-
-  try {
-    const existing: any = db.prepare("SELECT * FROM users WHERE id = ?").get(adminId);
-    if (!existing) {
-      return res.status(404).json({ error: "Administrator not found" });
-    }
-
-    db.prepare("UPDATE users SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(status, adminId);
-
-    const actionName = status === "SUSPENDED" ? "ADMIN_SUSPENDED" : "ADMIN_REACTIVATED";
-    logAuditEvent({
-      workspaceId: existing.workspace_id || 1,
-      userId: req.user?.id,
-      actorRole: req.user?.role,
-      action: actionName,
-      details: `${status === "SUSPENDED" ? "Suspended" : "Reactivated"} access for user #${adminId} (${existing.full_name}, ${existing.role}). Reason: ${reason || "SuperAdmin action"}`,
-      targetId: adminId,
-      targetType: "user",
-      outcome: "SUCCESS",
-      ipAddress: req.ip || "127.0.0.1"
-    });
-
-    broadcastServerEvent("EMPLOYEES_CHANGED", { workspaceId: existing.workspace_id || 1, action: "status_changed", userId: adminId });
-    res.json({ success: true, status });
-  } catch (err: any) {
-    console.error("SuperAdmin toggle admin status error:", err);
-    res.status(500).json({ error: "Failed to update administrator status" });
-  }
-});
-
-// Assign administrator to a workspace (SuperAdmin only)
-app.post("/api/superadmin/admins/:id/assign-workspace", authenticateToken, requireSuperAdmin, (req: AuthenticatedRequest, res: Response) => {
-  const adminId = parseInt(req.params.id, 10);
-  const { workspace_id } = req.body;
-
-  if (!workspace_id || isNaN(parseInt(workspace_id, 10))) {
-    return res.status(400).json({ error: "Valid target workspace ID is required" });
-  }
-
-  const targetWsId = parseInt(workspace_id, 10);
-
-  try {
-    const userRow: any = db.prepare("SELECT * FROM users WHERE id = ?").get(adminId);
-    if (!userRow) return res.status(404).json({ error: "User not found" });
-
-    const wsRow: any = db.prepare("SELECT * FROM workspaces WHERE id = ?").get(targetWsId);
-    if (!wsRow) return res.status(404).json({ error: "Target workspace not found" });
-
-    db.prepare("UPDATE users SET workspace_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(targetWsId, adminId);
-
-    logAuditEvent({
-      workspaceId: targetWsId,
-      userId: req.user?.id,
-      actorRole: req.user?.role,
-      action: "ADMIN_WORKSPACE_ASSIGNED",
-      details: `Reassigned ${userRow.full_name} (${userRow.role}) from Workspace #${userRow.workspace_id || "None"} to Workspace #${targetWsId} (${wsRow.name})`,
-      targetId: adminId,
-      targetType: "user",
-      outcome: "SUCCESS",
-      ipAddress: req.ip || "127.0.0.1"
-    });
-
-    broadcastServerEvent("EMPLOYEES_CHANGED", { workspaceId: targetWsId, action: "workspace_reassigned", userId: adminId });
-    res.json({ success: true, message: `Reassigned to ${wsRow.name}` });
-  } catch (err: any) {
-    console.error("Assign workspace error:", err);
-    res.status(500).json({ error: "Failed to reassign workspace" });
-  }
-});
-
-// Get all authorized workspaces for an administrator (SuperAdmin only)
-app.get("/api/superadmin/admins/:id/workspaces", authenticateToken, requireSuperAdmin, (req: AuthenticatedRequest, res: Response) => {
-  const adminId = parseInt(req.params.id, 10);
-  try {
-    const userRow: any = db.prepare("SELECT workspace_id FROM users WHERE id = ?").get(adminId);
-    if (!userRow) return res.status(404).json({ error: "Administrator not found" });
-
-    const primaryWsId = userRow.workspace_id;
-    const assignments = db.prepare("SELECT workspace_id FROM workspace_assignments WHERE user_id = ?").all(adminId) as any[];
-    const assignedIds = new Set<number>();
-    if (primaryWsId) assignedIds.add(Number(primaryWsId));
-    assignments.forEach(a => assignedIds.add(Number(a.workspace_id)));
-
-    res.json({
-      adminId,
-      primaryWorkspaceId: primaryWsId,
-      workspaceIds: Array.from(assignedIds)
-    });
-  } catch (err: any) {
-    console.error("Get admin workspaces error:", err);
-    res.status(500).json({ error: "Failed to fetch admin workspaces" });
-  }
-});
-
-// Update workspace assignments for an administrator (SuperAdmin only)
-app.post("/api/superadmin/admins/:id/workspaces", authenticateToken, requireSuperAdmin, (req: AuthenticatedRequest, res: Response) => {
-  const adminId = parseInt(req.params.id, 10);
-  const { workspace_ids, primary_workspace_id } = req.body;
-
-  if (!Array.isArray(workspace_ids)) {
-    return res.status(400).json({ error: "workspace_ids must be an array of workspace IDs" });
-  }
-
-  try {
-    const userRow: any = db.prepare("SELECT * FROM users WHERE id = ?").get(adminId);
-    if (!userRow) return res.status(404).json({ error: "Administrator not found" });
-
-    const primaryId = primary_workspace_id ? Number(primary_workspace_id) : (workspace_ids[0] ? Number(workspace_ids[0]) : userRow.workspace_id);
-
-    if (primaryId) {
-      db.prepare("UPDATE users SET workspace_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(primaryId, adminId);
-    }
-
-    db.prepare("DELETE FROM workspace_assignments WHERE user_id = ?").run(adminId);
-    const insertStmt = db.prepare("INSERT INTO workspace_assignments (user_id, workspace_id, assigned_by) VALUES (?, ?, ?)");
-    for (const wsId of workspace_ids) {
-      const numId = Number(wsId);
-      if (numId && !isNaN(numId)) {
-        try {
-          insertStmt.run(adminId, numId, req.user?.id);
-        } catch (_) {}
-      }
-    }
-
-    logAuditEvent({
-      workspaceId: primaryId || 1,
-      userId: req.user?.id,
-      actorRole: req.user?.role,
-      action: "ADMIN_WORKSPACES_UPDATED",
-      details: `Updated workspace assignments for ${userRow.full_name} (#${adminId}): [${workspace_ids.join(", ")}], primary: #${primaryId}`,
-      targetId: adminId,
-      targetType: "user",
-      outcome: "SUCCESS",
-      ipAddress: req.ip || "127.0.0.1"
-    });
-
-    res.json({ success: true, workspaceIds: workspace_ids, primaryWorkspaceId: primaryId });
-  } catch (err: any) {
-    console.error("Update admin workspaces error:", err);
-    res.status(500).json({ error: "Failed to update admin workspace assignments" });
-  }
-});
-
-// Comprehensive Audit Logs Endpoint (SuperAdmin sees all/filtered; Workspace Admin sees only authorized workspace)
-app.get("/api/audit-logs", authenticateToken, (req: AuthenticatedRequest, res: Response) => {
-  const role = req.user?.role;
-  const isSuper = isSuperAdmin(req.user);
-  const isManager = isWorkspaceAdmin(req.user) || role === "HR" || role === "Accountant";
-
-  if (!isSuper && !isManager) {
-    return res.status(403).json({ error: "Access denied. Only Administrators can review audit logs." });
-  }
-
-  const targetWs = req.query.workspace_id;
-  const actionFilter = req.query.action as string;
-  const outcomeFilter = req.query.outcome as string;
-  const search = req.query.search as string;
-  const limit = req.query.limit ? Math.min(parseInt(req.query.limit as string, 10), 500) : 150;
-
-  try {
-    let sql = `
-      SELECT al.*, u.full_name as actor_name, u.role as actor_user_role, w.name as workspace_name
-      FROM audit_logs al
-      LEFT JOIN users u ON al.user_id = u.id
-      LEFT JOIN workspaces w ON al.workspace_id = w.id
-      WHERE 1=1
-    `;
-    const params: any[] = [];
-
-    if (!isSuper) {
-      sql += ` AND al.workspace_id = ?`;
-      params.push(req.user?.workspace_id || 1);
-    } else if (targetWs && targetWs !== "all" && Number(targetWs) > 0) {
-      sql += ` AND al.workspace_id = ?`;
-      params.push(Number(targetWs));
-    }
-
-    if (actionFilter && actionFilter !== "ALL") {
-      sql += ` AND al.action = ?`;
-      params.push(actionFilter);
-    }
-
-    if (outcomeFilter && outcomeFilter !== "ALL") {
-      sql += ` AND al.outcome = ?`;
-      params.push(outcomeFilter);
-    }
-
-    if (search && search.trim().length > 0) {
-      sql += ` AND (al.details LIKE ? OR al.action LIKE ? OR u.full_name LIKE ?)`;
-      const term = `%${search.trim()}%`;
-      params.push(term, term, term);
-    }
-
-    sql += ` ORDER BY al.created_at DESC, al.id DESC LIMIT ?`;
-    params.push(limit);
-
-    const logs = db.prepare(sql).all(...params);
-    res.json(logs);
-  } catch (err: any) {
-    console.error("Fetch audit logs error:", err);
-    res.status(500).json({ error: "Failed to fetch audit logs" });
-  }
-});
-
-// Run Automated RBAC and Workspace Isolation Security Test Suite (SuperAdmin only)
-app.post("/api/security/run-tests", authenticateToken, requireSuperAdmin, async (req: AuthenticatedRequest, res: Response) => {
-  try {
-    const port = Number(process.env.PORT) || 3000;
-    const testReport = await runAutomatedSecurityTests(port);
-
-    logAuditEvent({
-      workspaceId: req.user?.workspace_id || 1,
-      userId: req.user?.id,
-      actorRole: req.user?.role,
-      action: "SECURITY_TEST_SUITE_EXECUTED",
-      details: `Executed automated security test suite: ${testReport.passed}/${testReport.total} tests passed (allPassed: ${testReport.allPassed})`,
-      outcome: testReport.allPassed ? "SUCCESS" : "FAILED",
-      ipAddress: req.ip || "127.0.0.1"
-    });
-
-    res.json(testReport);
-  } catch (err: any) {
-    console.error("Run security tests error:", err);
-    res.status(500).json({ error: "Failed to execute security tests: " + (err?.message || "Internal error") });
   }
 });
 
@@ -2474,7 +1852,21 @@ app.put("/api/site-settings", authenticateToken, (req: AuthenticatedRequest, res
     return res.status(400).json({ error: "Workspace not found for your account." });
   }
 
-  const targetWorkspaceId = workspaceId || req.body.workspace_id || 1;
+  let targetWorkspaceId = workspaceId || 1;
+  if (role === "SuperAdmin" && req.body.workspace_id) {
+    targetWorkspaceId = parseInt(req.body.workspace_id, 10);
+  } else if (req.body.workspace_id && parseInt(req.body.workspace_id, 10) !== workspaceId) {
+    recordAuditLog({
+      workspaceId: workspaceId,
+      userId: req.user?.id,
+      actorRole: role,
+      action: "UNAUTHORIZED_CROSS_WORKSPACE_ATTEMPT",
+      details: `Workspace Admin ${req.user?.full_name} attempted to modify settings for unauthorized workspace #${req.body.workspace_id}`,
+      ipAddress: getClientIp(req),
+      outcome: "DENIED"
+    });
+    return res.status(403).json({ error: "Access denied. You cannot modify settings for another workspace." });
+  }
 
   const {
     office_name,
@@ -3375,7 +2767,7 @@ app.delete("/api/holidays/:id", authenticateToken, (req: AuthenticatedRequest, r
 
 // Check Effective Work Status for any date & time
 app.get("/api/work-calendar/status", authenticateToken, (req: AuthenticatedRequest, res: Response) => {
-  const workspaceId = getAuthorizedWorkspaceId(req, req.query.workspace_id);
+  const workspaceId = req.user?.workspace_id || 1;
   let dateStr = (req.query.date as string) || getEthiopianDateString();
   let timeStr = (req.query.time as string) || getEthiopianTimeString();
   const session = (req.query.session as string) || undefined;
@@ -3450,7 +2842,7 @@ app.get("/api/work-calendar/status", authenticateToken, (req: AuthenticatedReque
 
 // Get Overtime Records (with employee names and filters)
 app.get("/api/overtime", authenticateToken, (req: AuthenticatedRequest, res: Response) => {
-  const workspaceId = getAuthorizedWorkspaceId(req, req.query.workspace_id);
+  const workspaceId = req.user?.workspace_id || 1;
   const role = req.user?.role || "";
   const isManager = ["AdminCreator", "AdminManager", "SuperAdmin", "HR"].includes(role);
 
@@ -3497,7 +2889,7 @@ app.get("/api/overtime", authenticateToken, (req: AuthenticatedRequest, res: Res
 
 // Get Overtime Dashboard Stats
 app.get("/api/overtime/stats", authenticateToken, (req: AuthenticatedRequest, res: Response) => {
-  const workspaceId = getAuthorizedWorkspaceId(req, req.query.workspace_id);
+  const workspaceId = req.user?.workspace_id || 1;
   const todayStr = getEthiopianDateString();
 
   try {
@@ -3863,7 +3255,7 @@ app.delete("/api/overtime/:id", authenticateToken, (req: AuthenticatedRequest, r
 
 // 1. Get Penalties & Late Records from Database
 app.get("/api/penalties", authenticateToken, (req: AuthenticatedRequest, res: Response) => {
-  const workspaceId = getAuthorizedWorkspaceId(req, req.query.workspace_id);
+  const workspaceId = req.user?.workspace_id || 1;
   const role = req.user?.role || "";
   const isManager = ["AdminCreator", "AdminManager", "SuperAdmin", "HR", "Bootstrap"].includes(role);
 
@@ -4757,17 +4149,6 @@ app.all("/api/work-calendar/run-tests", (req: Request, res: Response) => {
   }
 });
 
-// Run 14 Comprehensive Attendance Session Detection Validation Test Cases
-app.all("/api/attendance/session-tests", (req: Request, res: Response) => {
-  try {
-    const testResults = runAttendanceSessionTests();
-    res.json(testResults);
-  } catch (error) {
-    console.error("Run session detection tests error:", error);
-    res.status(500).json({ error: "Failed to execute attendance session validation tests" });
-  }
-});
-
 // Check-In (Enterprise Attendance Verification Engine)
 app.post("/api/attendance/check-in", authenticateToken, (req: AuthenticatedRequest, res: Response) => {
   if (req.user?.role === "Bootstrap") {
@@ -4793,49 +4174,46 @@ app.post("/api/attendance/check-in", authenticateToken, (req: AuthenticatedReque
   const complianceRoles = ["Employee", "Purchaser", "Accountant", "Engineer", "HR", "AdminCreator", "AdminManager"];
 
   try {
-    const userRow: any = db.prepare("SELECT workspace_id, created_by FROM users WHERE id = ?").get(req.user?.id);
+    const userRow: any = db.prepare("SELECT workspace_id, created_by, role FROM users WHERE id = ?").get(req.user?.id);
     let workspaceId = userRow?.workspace_id || req.user?.workspace_id;
-    if (!workspaceId && userRow?.created_by) {
-      const creatorRow: any = db.prepare("SELECT workspace_id FROM users WHERE id = ?").get(userRow.created_by);
-      workspaceId = creatorRow?.workspace_id;
-    }
     if (!workspaceId) {
       const createdWs: any = db.prepare("SELECT id FROM workspaces WHERE created_by = ? ORDER BY id ASC LIMIT 1").get(req.user?.id);
-      workspaceId = createdWs?.id || 1;
+      workspaceId = createdWs ? createdWs.id : 1;
     }
 
     const siteSettings = AttendanceService.getSiteSettings(workspaceId);
-    const sessionDetection = detectActiveAttendanceSession(nowTimeStr, siteSettings);
-    const activeSession = sessionDetection.activeSession;
-    const nowTotalMins = (nowH || 0) * 60 + (nowM || 0);
+    const sessionInfo = AttendanceService.determineAttendanceSession(siteSettings, nowTimeStr);
+    const nowTotalMins = sessionInfo.nowTotalMins;
 
-    // Reject check-in immediately if no attendance session is currently active
-    if (!activeSession) {
+    // Reject check-in if no attendance session is currently active
+    if (!sessionInfo.activeSession) {
       return res.status(400).json({
-        error: `No attendance session is currently active. ${sessionDetection.message}`,
+        error: sessionInfo.isBetweenShifts
+          ? `No attendance session is currently active. The Morning shift concluded at ${formatEthMinutesToStr(sessionInfo.morningEndEthMins)}. Afternoon check-in opens at ${sessionInfo.nextSessionOpensAt || 'the scheduled afternoon start'}.`
+          : (sessionInfo.statusMessage || "No attendance session is currently active."),
         code: "OUTSIDE_ATTENDANCE_SESSION",
-        current_time: nowTimeStr,
-        session_status: sessionDetection.status,
-        next_session: sessionDetection.nextSession,
-        next_session_opens_at: sessionDetection.nextSessionOpensAt,
-        shift_windows: sessionDetection.shiftWindows
+        active_session: null,
+        session_state: sessionInfo.sessionState,
+        is_between_shifts: sessionInfo.isBetweenShifts,
+        next_session: sessionInfo.nextSession,
+        next_session_opens_at: sessionInfo.nextSessionOpensAt,
+        current_time: nowTimeStr
       });
     }
 
-    if (session && session !== activeSession) {
-      const targetWin = sessionDetection.shiftWindows;
-      const activeWindowStr = activeSession === "Morning" 
-        ? `${targetWin.morningStartStr} – ${targetWin.morningEndStr}` 
-        : `${targetWin.afternoonStartStr} – ${targetWin.afternoonEndStr}`;
+    const authoritativeActiveSession = sessionInfo.activeSession;
+
+    // Validate client-requested session against authoritative active session
+    if (session && session !== authoritativeActiveSession) {
       return res.status(400).json({
-        error: `Current time (${nowTimeStr}) is for the ${activeSession} session (${activeWindowStr}). You cannot check in for the ${session} session.`,
+        error: `Current time (${nowTimeStr}) is for the ${authoritativeActiveSession} session. You cannot check in for the ${session} session.`,
         code: "SESSION_MISMATCH",
-        active_session: activeSession,
-        requested_session: session,
-        current_time: nowTimeStr,
-        shift_windows: sessionDetection.shiftWindows
+        active_session: authoritativeActiveSession,
+        requested_session: session
       });
     }
+
+    const activeSession: "Morning" | "Afternoon" = authoritativeActiveSession;
 
     // STEP 0: DEVICE BINDING & ANTI-BUDDY PUNCHING VALIDATION
     const currentUser: any = db.prepare(`
@@ -5026,6 +4404,25 @@ app.post("/api/attendance/check-in", authenticateToken, (req: AuthenticatedReque
       }
     }
 
+    // Validate session check-in eligibility dynamically based on workspace shift schedule
+    if (activeSession === "Morning") {
+      if (!sessionInfo.canCheckInMorning) {
+        return res.status(400).json({
+          error: `Morning check-in closed at ${formatEthMinutesToStr(sessionInfo.morningLatestCheckinEthMins)}. Morning shift ends at ${formatEthMinutesToStr(sessionInfo.morningEndEthMins)}. Current time is ${nowTimeStr}.`,
+          code: "MORNING_CHECKIN_CLOSED",
+          active_session: sessionInfo.activeSession
+        });
+      }
+    } else if (activeSession === "Afternoon") {
+      if (!sessionInfo.canCheckInAfternoon) {
+        return res.status(400).json({
+          error: `Afternoon check-in is not permitted at this time. Afternoon check-in window: ${formatEthMinutesToStr(sessionInfo.afternoonEarliestCheckinEthMins)} to ${formatEthMinutesToStr(sessionInfo.afternoonLatestCheckinEthMins)}. Current time is ${nowTimeStr}.`,
+          code: "AFTERNOON_CHECKIN_CLOSED",
+          active_session: sessionInfo.activeSession
+        });
+      }
+    }
+
     // Prevent check-in if user is on approved leave / permission for this session or full day
     const approvedLeaves: any[] = db.prepare(`
       SELECT p.request_type, p.session 
@@ -5156,14 +4553,19 @@ app.post("/api/attendance/check-in", authenticateToken, (req: AuthenticatedReque
 
     // 1. Enforce Earliest Allowed Check-in Time (Both Morning & Afternoon Sessions)
     const earliestCheckinStr = activeSession === "Morning"
-      ? (siteSettings.morning_earliest_checkin_time || siteSettings.earliest_checkin_time || "01:00")
-      : (siteSettings.afternoon_earliest_checkin_time || "06:30");
+      ? (siteSettings.morning_earliest_checkin_time || siteSettings.earliest_checkin_time || "07:00")
+      : (siteSettings.afternoon_earliest_checkin_time || "12:30");
 
     if (earliestCheckinStr) {
-      const earliestEthMins = parseTimeToEthiopianMinutes(earliestCheckinStr, activeSession === "Morning" ? "MorningCheckin" : "AfternoonCheckin");
-      if (earliestEthMins !== null && nowTotalMins < earliestEthMins) {
+      const earliestEthMins = parseTimeToEthMinutes(earliestCheckinStr, activeSession === "Morning" ? 60 : 360, activeSession);
+      // For Afternoon, if morning shift has concluded, allow early afternoon check-in
+      const effectiveEarliestMins = activeSession === "Afternoon"
+        ? Math.min(earliestEthMins, sessionInfo.morningEndEthMins)
+        : earliestEthMins;
+
+      if (nowTotalMins < effectiveEarliestMins) {
         return res.status(400).json({
-          error: `Check-in restriction: Early check-in for ${activeSession} session is not permitted before ${earliestCheckinStr}. Company policy restricts check-in prior to this window.`,
+          error: `Check-in restriction: Early check-in for ${activeSession} session is not permitted before ${formatToEthiopianTime(earliestCheckinStr, activeSession).shortText}. Company policy restricts check-in prior to this window.`,
           code: "EARLIEST_CHECKIN_RESTRICTION",
           earliest_allowed: earliestCheckinStr,
           session: activeSession
@@ -5173,14 +4575,14 @@ app.post("/api/attendance/check-in", authenticateToken, (req: AuthenticatedReque
 
     // 2. Enforce Latest Allowed Check-in Cutoff (Both Morning & Afternoon Sessions)
     const latestCheckinStr = activeSession === "Morning"
-      ? (siteSettings.morning_latest_checkin_time || siteSettings.latest_checkin_time || "04:30")
-      : (siteSettings.afternoon_latest_checkin_time || "09:30");
+      ? (siteSettings.morning_latest_checkin_time || siteSettings.latest_checkin_time || "10:30")
+      : (siteSettings.afternoon_latest_checkin_time || "15:30");
 
     if (latestCheckinStr) {
-      const latestEthMins = parseTimeToEthiopianMinutes(latestCheckinStr, activeSession === "Morning" ? "MorningCheckin" : "AfternoonCheckin");
-      if (latestEthMins !== null && nowTotalMins > latestEthMins) {
+      const latestEthMins = parseTimeToEthMinutes(latestCheckinStr, activeSession === "Morning" ? 270 : 570, activeSession);
+      if (nowTotalMins > latestEthMins) {
         return res.status(400).json({
-          error: `Check-in restriction: ${activeSession} session check-in window closed at ${latestCheckinStr}. Company policy restricts check-ins after this cutoff time.`,
+          error: `Check-in restriction: ${activeSession} session check-in window closed at ${formatToEthiopianTime(latestCheckinStr, activeSession).shortText}. Company policy restricts check-ins after this cutoff time.`,
           code: "LATEST_CHECKIN_RESTRICTION",
           latest_allowed: latestCheckinStr,
           session: activeSession
@@ -5190,9 +4592,9 @@ app.post("/api/attendance/check-in", authenticateToken, (req: AuthenticatedReque
 
     // 3. Scheduled session start & lateness evaluation
     const scheduledStartStr = activeSession === "Morning" 
-      ? (siteSettings.morning_start_time || siteSettings.work_start_time || "02:00") 
-      : (siteSettings.afternoon_start_time || "07:00");
-    const scheduledStartEthMins = parseTimeToEthiopianMinutes(scheduledStartStr, activeSession === "Morning" ? "MorningStart" : "AfternoonStart") ?? (activeSession === "Morning" ? 120 : 420);
+      ? (siteSettings.morning_start_time || siteSettings.work_start_time || "08:30") 
+      : (siteSettings.afternoon_start_time || "13:30");
+    const scheduledStartEthMins = parseTimeToEthMinutes(scheduledStartStr, activeSession === "Morning" ? 150 : 450, activeSession);
     const sessionGraceMins = activeSession === "Morning"
       ? (siteSettings.morning_late_grace_minutes ?? siteSettings.late_grace_minutes ?? 15)
       : (siteSettings.afternoon_late_grace_minutes ?? siteSettings.late_grace_minutes ?? 15);
@@ -5343,15 +4745,18 @@ app.post("/api/attendance/check-out", authenticateToken, (req: AuthenticatedRequ
   const complianceRoles = ["Employee", "Purchaser", "Accountant", "Engineer", "HR", "AdminCreator", "AdminManager"];
 
   try {
-    const userRowOut: any = db.prepare("SELECT workspace_id, created_by FROM users WHERE id = ?").get(req.user?.id);
-    let workspaceId = userRowOut?.workspace_id || req.user?.workspace_id;
-    if (!workspaceId && userRowOut?.created_by) {
-      const creatorRow: any = db.prepare("SELECT workspace_id FROM users WHERE id = ?").get(userRowOut.created_by);
-      workspaceId = creatorRow?.workspace_id;
-    }
+    const createdWsOut: any = db.prepare("SELECT id FROM workspaces WHERE created_by = ? ORDER BY id ASC LIMIT 1").get(req.user?.id);
+    let workspaceId = createdWsOut ? createdWsOut.id : req.user?.workspace_id;
     if (!workspaceId) {
-      const createdWsOut: any = db.prepare("SELECT id FROM workspaces WHERE created_by = ? ORDER BY id ASC LIMIT 1").get(req.user?.id);
-      workspaceId = createdWsOut?.id || 1;
+      const userRow: any = db.prepare("SELECT workspace_id, created_by FROM users WHERE id = ?").get(req.user?.id);
+      if (userRow?.workspace_id) {
+        workspaceId = userRow.workspace_id;
+      } else if (userRow?.created_by) {
+        const creatorRow: any = db.prepare("SELECT workspace_id FROM users WHERE id = ?").get(userRow.created_by);
+        workspaceId = creatorRow?.workspace_id || 1;
+      } else {
+        workspaceId = 1;
+      }
     }
 
     // STEP 0: DEVICE BINDING VALIDATION FOR CHECK-OUT
@@ -5418,28 +4823,28 @@ app.post("/api/attendance/check-out", authenticateToken, (req: AuthenticatedRequ
 
     const siteSettings = AttendanceService.getSiteSettings(workspaceId);
 
-    const morningEndEthMins = parseTimeToEthiopianMinutes(siteSettings.morning_end_time, "MorningEnd") ?? 360;
+    const morningEndEthMins = parseTimeToEthMinutes(siteSettings.morning_end_time || "12:30", 390, "Morning");
     const morningGrace = siteSettings.morning_checkout_grace_minutes ?? siteSettings.checkout_grace_minutes ?? 30;
     const morningCheckoutCutoff = siteSettings.morning_latest_checkout_time
-      ? (parseTimeToEthiopianMinutes(siteSettings.morning_latest_checkout_time, "MorningCheckout") ?? (morningEndEthMins + morningGrace))
-      : (morningEndEthMins + morningGrace);
+      ? parseTimeToEthMinutes(siteSettings.morning_latest_checkout_time, 450, "Morning")
+      : morningEndEthMins + morningGrace;
 
-    const afternoonEndEthMins = parseTimeToEthiopianMinutes(siteSettings.afternoon_end_time || siteSettings.work_end_time, "AfternoonEnd") ?? 660;
+    const afternoonEndEthMins = parseTimeToEthMinutes(siteSettings.afternoon_end_time || siteSettings.work_end_time || "17:30", 690, "Afternoon");
     const afternoonGrace = siteSettings.afternoon_checkout_grace_minutes ?? siteSettings.checkout_grace_minutes ?? 30;
     const afternoonCheckoutCutoff = (siteSettings.afternoon_latest_checkout_time || siteSettings.latest_checkout_time)
-      ? (parseTimeToEthiopianMinutes(siteSettings.afternoon_latest_checkout_time || siteSettings.latest_checkout_time, "AfternoonCheckout") ?? (afternoonEndEthMins + afternoonGrace))
-      : (afternoonEndEthMins + afternoonGrace);
+      ? parseTimeToEthMinutes(siteSettings.afternoon_latest_checkout_time || siteSettings.latest_checkout_time, 720, "Afternoon")
+      : afternoonEndEthMins + afternoonGrace;
 
     // Enforce earliest allowed checkout for the active record session:
     const earliestCheckoutStr = record.session === "Morning"
-      ? (siteSettings.morning_earliest_checkout_time || "05:30")
-      : (siteSettings.afternoon_earliest_checkout_time || siteSettings.earliest_checkout_time || "10:30");
+      ? (siteSettings.morning_earliest_checkout_time || "11:30")
+      : (siteSettings.afternoon_earliest_checkout_time || siteSettings.earliest_checkout_time || "16:30");
 
     if (earliestCheckoutStr) {
-      const earliestCheckoutEthMins = parseTimeToEthiopianMinutes(earliestCheckoutStr, record.session === "Morning" ? "MorningCheckout" : "AfternoonCheckout");
-      if (earliestCheckoutEthMins !== null && nowTotalMins < earliestCheckoutEthMins) {
+      const earliestCheckoutEthMins = parseTimeToEthMinutes(earliestCheckoutStr, record.session === "Morning" ? 330 : 630, record.session);
+      if (nowTotalMins < earliestCheckoutEthMins) {
         return res.status(400).json({
-          error: `Checkout restriction: Early checkout for ${record.session} session is not permitted before ${earliestCheckoutStr}. Company policy restricts checkout prior to this window.`,
+          error: `Checkout restriction: Early checkout for ${record.session} session is not permitted before ${formatToEthiopianTime(earliestCheckoutStr, record.session).shortText}. Company policy restricts checkout prior to this window.`,
           code: "EARLIEST_CHECKOUT_RESTRICTION",
           earliest_allowed: earliestCheckoutStr,
           session: record.session
@@ -5578,7 +4983,7 @@ app.post("/api/attendance/check-out", authenticateToken, (req: AuthenticatedRequ
     const requireApproval = (siteSettings.require_overtime_approval ?? 1) === 1;
     const overtimeStatus = hasOvertime ? (requireApproval ? "PENDING" : "APPROVED") : null;
 
-    const sessionStartMins = parseTimeToEthiopianMinutes(sessionStartStr, record.session === "Morning" ? "MorningStart" : "AfternoonStart") ?? (record.session === "Morning" ? 120 : 420);
+    const sessionStartMins = parseTimeToEthMinutes(sessionStartStr, record.session === "Morning" ? 150 : 450, record.session);
     const isLateCheckin = AttendanceService.evaluateLateness(
       record.session, 
       checkInTime, 
@@ -5760,27 +5165,18 @@ app.get("/api/attendance/status", authenticateToken, (req: AuthenticatedRequest,
   const todayStr = getEthiopianDateString();
   const nowTimeStr = getEthiopianTimeString();
   const userId = req.user?.id;
-  const [nowH, nowM] = nowTimeStr.split(":").map(Number);
-  const nowTotalMins = (nowH || 0) * 60 + (nowM || 0);
-
-  const userWs: any = db.prepare("SELECT workspace_id, created_by FROM users WHERE id = ?").get(userId);
-  let workspaceId = userWs?.workspace_id || req.user?.workspace_id;
-  if (!workspaceId && userWs?.created_by) {
-    const creatorRow: any = db.prepare("SELECT workspace_id FROM users WHERE id = ?").get(userWs.created_by);
-    workspaceId = creatorRow?.workspace_id;
-  }
-  if (!workspaceId) {
-    workspaceId = 1;
-  }
+  const userRow: any = db.prepare("SELECT workspace_id, created_by, role FROM users WHERE id = ?").get(userId);
+  const workspaceId = userRow?.workspace_id || req.user?.workspace_id || 1;
   const siteSettings = AttendanceService.getSiteSettings(workspaceId);
-  const sessionDetection = detectActiveAttendanceSession(nowTimeStr, siteSettings);
-  const activeSession = sessionDetection.activeSession;
+  const sessionInfo = AttendanceService.determineAttendanceSession(siteSettings, nowTimeStr);
+  const activeSession = sessionInfo.activeSession;
+  const nowTotalMins = sessionInfo.nowTotalMins;
 
   try {
     // 0. Run automated shift exception evaluation
     AttendanceService.evaluateAttendanceExceptionsAndShifts(workspaceId, todayStr, nowTimeStr);
 
-    // 1. Check open record today for current active session, or any unclosed session today
+    // 1. Check open record today for current active session or any open session
     const openToday: any = activeSession 
       ? db.prepare(`
           SELECT * FROM attendance 
@@ -5790,20 +5186,15 @@ app.get("/api/attendance/status", authenticateToken, (req: AuthenticatedRequest,
       : db.prepare(`
           SELECT * FROM attendance 
           WHERE user_id = ? AND date = ? AND check_out_time IS NULL
-          ORDER BY check_in_time DESC LIMIT 1
+          LIMIT 1
         `).get(userId, todayStr);
 
-    // Check if user has already attended/completed this active session today
-    const attendedCurrentSession: any = activeSession 
-      ? db.prepare(`
-          SELECT * FROM attendance 
-          WHERE user_id = ? AND date = ? AND session = ?
-          LIMIT 1
-        `).get(userId, todayStr, activeSession)
-      : null;
+    // Dynamic session cutoffs based on workspace schedule
+    const morningGrace = siteSettings.morning_checkout_grace_minutes ?? siteSettings.checkout_grace_minutes ?? 30;
+    const morningCutoffMins = sessionInfo.morningEndEthMins + morningGrace;
 
-    const morningCutoffMins = sessionDetection.shiftWindows.morningEndMins + (siteSettings.morning_checkout_grace_minutes ?? siteSettings.checkout_grace_minutes ?? 30);
-    const afternoonCutoffMins = sessionDetection.shiftWindows.afternoonEndMins + (siteSettings.afternoon_checkout_grace_minutes ?? siteSettings.checkout_grace_minutes ?? 30);
+    const afternoonGrace = siteSettings.afternoon_checkout_grace_minutes ?? siteSettings.checkout_grace_minutes ?? 30;
+    const afternoonCutoffMins = sessionInfo.afternoonEndEthMins + afternoonGrace;
 
     // 2. Check open/missing checkout from past days OR expired sessions today (Strict Morning & Afternoon rules)
     const pastMissing: any[] = db.prepare(`
@@ -5832,23 +5223,44 @@ app.get("/api/attendance/status", authenticateToken, (req: AuthenticatedRequest,
       }
     }
 
-    const canCheckIn = !!activeSession && !openToday && !attendedCurrentSession && pastMissing.length === 0;
+    const canCheckIn = !openToday && pastMissing.length === 0 && sessionInfo.canCheckIn;
     const canCheckOut = !!openToday;
+
+    let blockReason: string | null = null;
+    if (!canCheckIn) {
+      if (pastMissing.length > 0) {
+        blockReason = "Attendance is locked due to an unclosed previous shift requiring administrator correction.";
+      } else if (openToday) {
+        blockReason = `You already have an active check-in for the ${openToday.session} session.`;
+      } else if (!activeSession) {
+        blockReason = sessionInfo.blockReason || (sessionInfo.isBetweenShifts 
+          ? `Between shifts: Morning shift has concluded. Afternoon check-in opens at ${sessionInfo.nextSessionOpensAt || '07:00'}.`
+          : "No attendance session is currently active.");
+      } else if (activeSession === "Morning" && !sessionInfo.canCheckInMorning) {
+        blockReason = `Morning check-in closed at ${formatEthMinutesToStr(sessionInfo.morningLatestCheckinEthMins)}.`;
+      } else if (activeSession === "Afternoon" && !sessionInfo.canCheckInAfternoon) {
+        blockReason = `Afternoon check-in closed at ${formatEthMinutesToStr(sessionInfo.afternoonLatestCheckinEthMins)}.`;
+      }
+    }
 
     res.json({
       hasOpenToday: !!openToday,
       openTodayRecord: openToday || null,
       hasMissingCheckout: pastMissing.length > 0,
       missingRecords: pastMissing,
-      activeSession,
-      sessionStatus: sessionDetection.status,
-      sessionMessage: sessionDetection.message,
-      nextSession: sessionDetection.nextSession,
-      nextSessionOpensAt: sessionDetection.nextSessionOpensAt,
-      shiftWindows: sessionDetection.shiftWindows,
-      attendedCurrentSession: !!attendedCurrentSession,
+      activeSession: sessionInfo.activeSession,
+      sessionState: sessionInfo.sessionState,
+      sessionInfo,
       canCheckIn,
       canCheckOut,
+      canCheckInMorning: sessionInfo.canCheckInMorning,
+      canCheckInAfternoon: sessionInfo.canCheckInAfternoon,
+      isBetweenShifts: sessionInfo.isBetweenShifts,
+      isOutsideHours: sessionInfo.isOutsideHours,
+      nextSession: sessionInfo.nextSession,
+      nextSessionOpensAt: sessionInfo.nextSessionOpensAt,
+      nextSessionOpensInMinutes: sessionInfo.nextSessionOpensInMinutes,
+      blockReason,
       todayDate: todayStr,
       currentTime: nowTimeStr,
       serverEpochMs: Date.now(),
@@ -5870,13 +5282,15 @@ app.get("/api/attendance/missing-checkouts", authenticateToken, (req: Authentica
   const nowTotalMins = (nowH || 0) * 60 + (nowM || 0);
 
   try {
+    const siteSettings = AttendanceService.getSiteSettings(currentWorkspaceId || 1);
+    const sessionInfo = AttendanceService.determineAttendanceSession(siteSettings, nowTimeStr);
+    const morningGrace = siteSettings.morning_checkout_grace_minutes ?? siteSettings.checkout_grace_minutes ?? 30;
+    const morningCutoffMins = sessionInfo.morningEndEthMins + morningGrace;
+    const afternoonGrace = siteSettings.afternoon_checkout_grace_minutes ?? siteSettings.checkout_grace_minutes ?? 30;
+    const afternoonCutoffMins = sessionInfo.afternoonEndEthMins + afternoonGrace;
+
     // Run automated shift exception evaluation first
     AttendanceService.evaluateAttendanceExceptionsAndShifts(currentWorkspaceId || 1, todayStr, nowTimeStr);
-
-    const wsSettings = AttendanceService.getSiteSettings(currentWorkspaceId || 1);
-    const shiftWindows = getWorkspaceShiftWindows(wsSettings);
-    const morningCutoffMins = shiftWindows.morningEndMins + (wsSettings.morning_checkout_grace_minutes ?? wsSettings.checkout_grace_minutes ?? 30);
-    const afternoonCutoffMins = shiftWindows.afternoonEndMins + (wsSettings.afternoon_checkout_grace_minutes ?? wsSettings.checkout_grace_minutes ?? 30);
 
     let records: any[];
     if (currentRole === "SuperAdmin") {
@@ -6553,7 +5967,7 @@ app.get("/api/attendance/history", authenticateToken, (req: AuthenticatedRequest
 });
 
 // --- MODULE 1: ANALYTICS DASHBOARD API ---
-app.get(["/api/attendance/dashboard", "/api/dashboard"], authenticateToken, (req: AuthenticatedRequest, res: Response) => {
+app.get("/api/attendance/dashboard", authenticateToken, (req: AuthenticatedRequest, res: Response) => {
   const currentRole = req.user?.role;
   const currentWorkspaceId = req.user?.workspace_id;
 
@@ -8206,25 +7620,13 @@ app.get("/api/salaries", authenticateToken, (req: AuthenticatedRequest, res: Res
     const params: any[] = [];
 
     if (currentRole === "SuperAdmin") {
-      const targetWs = req.query.workspace_id;
-      if (targetWs && targetWs !== "all" && Number(targetWs) > 0) {
-        usersQuery = `
-          SELECT u.*, w.name as workspace_name 
-          FROM users u 
-          LEFT JOIN workspaces w ON u.workspace_id = w.id
-          WHERE u.role IN ('Employee', 'Purchaser', 'Accountant', 'Engineer', 'HR') AND u.workspace_id = ?
-          ORDER BY u.full_name ASC
-        `;
-        params.push(Number(targetWs));
-      } else {
-        usersQuery = `
-          SELECT u.*, w.name as workspace_name 
-          FROM users u 
-          LEFT JOIN workspaces w ON u.workspace_id = w.id
-          WHERE u.role IN ('Employee', 'Purchaser', 'Accountant', 'Engineer', 'HR')
-          ORDER BY u.full_name ASC
-        `;
-      }
+      usersQuery = `
+        SELECT u.*, w.name as workspace_name 
+        FROM users u 
+        LEFT JOIN workspaces w ON u.workspace_id = w.id
+        WHERE u.role IN ('Employee', 'Purchaser', 'Accountant', 'Engineer', 'HR')
+        ORDER BY u.full_name ASC
+      `;
     } else if (currentRole === "Bootstrap") {
       usersQuery = `
         SELECT u.*, w.name as workspace_name 
@@ -8476,8 +7878,21 @@ app.put("/api/employees/:id/compensation", authenticateToken, (req: Authenticate
     if (currentRole !== "SuperAdmin" && currentRole !== "Bootstrap" && employee.workspace_id !== currentWorkspaceId) {
       return res.status(403).json({ error: "Access denied. Data isolation violation." });
     }
+
     if (parseInt(id, 10) === req.user?.id && currentRole !== "SuperAdmin") {
-      return res.status(403).json({ error: "Access denied. Administrators cannot modify their own salary or compensation package." });
+      recordAuditLog({
+        workspaceId: currentWorkspaceId,
+        userId: req.user?.id,
+        actorRole: currentRole,
+        action: "UNAUTHORIZED_SELF_COMPENSATION_CHANGE",
+        details: `Administrator ${req.user?.full_name} attempted to modify their own compensation package without SuperAdmin authorization`,
+        ipAddress: getClientIp(req),
+        outcome: "DENIED"
+      });
+      return res.status(403).json({
+        error: "Access denied. Independent approval is required: administrators cannot modify their own salary or compensation packages.",
+        code: "SELF_COMPENSATION_CHANGE_BLOCKED"
+      });
     }
 
     const newHourly = hourly_rate !== undefined ? parseFloat(hourly_rate) : employee.hourly_rate;
@@ -8586,6 +8001,22 @@ app.post("/api/salaries/disburse", authenticateToken, (req: AuthenticatedRequest
       return res.status(400).json({ error: "At least one employee ID is required for disbursement." });
     }
 
+    if (targetUserIds.includes(req.user?.id) && currentRole !== "SuperAdmin") {
+      recordAuditLog({
+        workspaceId: currentWorkspaceId,
+        userId: req.user?.id,
+        actorRole: currentRole,
+        action: "UNAUTHORIZED_SELF_PAYROLL_APPROVAL",
+        details: `Administrator ${req.user?.full_name} attempted to self-approve/disburse their own payroll without SuperAdmin authorization`,
+        ipAddress: getClientIp(req),
+        outcome: "DENIED"
+      });
+      return res.status(403).json({
+        error: "Access denied. Independent approval is required: administrators cannot approve or disburse their own salary payments.",
+        code: "SELF_PAYROLL_APPROVAL_BLOCKED"
+      });
+    }
+
     const payDate = req.body.payment_date || todayStr;
     const payNotes = req.body.notes || null;
     const ref = payment_reference || `DISB-${startStr.replace(/-/g, "")}-${Date.now().toString().slice(-4)}`;
@@ -8619,7 +8050,6 @@ app.post("/api/salaries/disburse", authenticateToken, (req: AuthenticatedRequest
       const user = db.prepare("SELECT * FROM users WHERE id = ?").get(uid) as any;
       if (!user) return;
       if (currentRole !== "SuperAdmin" && currentRole !== "Bootstrap" && user.workspace_id !== currentWorkspaceId) return;
-      if (uid === req.user?.id && currentRole !== "SuperAdmin") return; // Prevent administrators from approving or disbursing their own salary
 
       const calc = calculateEnterprisePayrollForUser(user, startStr, endStr, filterType);
 

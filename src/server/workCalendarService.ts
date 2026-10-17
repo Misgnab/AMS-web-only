@@ -1,6 +1,6 @@
 import { db } from "./database.ts";
 import { toEthiopian, toGregorian } from "ethiopian-date";
-import { parseTimeToEthiopianMinutes } from "../utils/sessionDetection.ts";
+import { parseTimeToEthMinutes } from "../utils/ethiopianTime.ts";
 import type { 
   EffectiveWorkStatus, 
   WorkScheduleDay, 
@@ -244,43 +244,13 @@ export class WorkCalendarService {
     // Fetch workspace settings
     const settings: any = db.prepare("SELECT * FROM site_settings WHERE workspace_id = ?").get(workspaceId) || {};
 
-    const settingToEthMinutes = (timeStr?: string, defaultVal: number = 0): number => {
-      if (!timeStr) return defaultVal;
-      const parts = timeStr.trim().split(":");
-      const h = parseInt(parts[0], 10);
-      const m = parseInt(parts[1] || "0", 10);
-      if (isNaN(h)) return defaultVal;
-      // Convert 24-hr Gregorian ("08:30" -> 02:30 Ethiopian / 150 mins)
-      const ethH = (h >= 6 && h <= 23) ? ((h - 6 + 24) % 24) : h;
-      return ethH * 60 + m;
+    const settingToEthMinutes = (timeStr?: string, defaultVal: number = 0, sessHint?: string): number => {
+      return parseTimeToEthMinutes(timeStr, defaultVal, sessHint);
     };
 
     const punchToEthMinutes = (timeStr?: string, defaultVal: number = 0, sess?: string): number => {
       if (!timeStr) return defaultVal;
-      const parts = timeStr.trim().split(":");
-      let h = parseInt(parts[0], 10);
-      const m = parseInt(parts[1] || "0", 10);
-      if (isNaN(h)) return defaultVal;
-
-      if (sess === "Morning") {
-        // Ethiopian morning is 01..06. Gregorian morning is 07..12.
-        if (h >= 7 && h <= 12) {
-          h = h - 6;
-        }
-      } else if (sess === "Afternoon") {
-        // Ethiopian afternoon is 07..12. Gregorian afternoon is 13..23.
-        if (h >= 13) {
-          h = (h - 6 + 24) % 24;
-        }
-      } else {
-        // Full day / Unspecified:
-        if (h >= 6 && h <= 12) {
-          h = h - 6;
-        } else if (h >= 13) {
-          h = (h - 6 + 24) % 24;
-        }
-      }
-      return h * 60 + m;
+      return parseTimeToEthMinutes(timeStr, defaultVal, sess);
     };
 
     // Normal session scheduled start & end in Ethiopian clock minutes from workspace settings
@@ -288,14 +258,14 @@ export class WorkCalendarService {
     let normalEndMins = 390;   // Default 06:30 (12:30 PM)
 
     if (session === "Morning") {
-      normalStartMins = parseTimeToEthiopianMinutes(settings?.morning_start_time || settings?.work_start_time, "MorningStart") ?? 120;
-      normalEndMins = parseTimeToEthiopianMinutes(settings?.morning_end_time, "MorningEnd") ?? 360;
+      normalStartMins = settingToEthMinutes(settings?.morning_start_time || settings?.work_start_time, 150, "Morning");
+      normalEndMins = settingToEthMinutes(settings?.morning_end_time, 390, "Morning");
     } else if (session === "Afternoon") {
-      normalStartMins = parseTimeToEthiopianMinutes(settings?.afternoon_start_time, "AfternoonStart") ?? 420;
-      normalEndMins = parseTimeToEthiopianMinutes(settings?.afternoon_end_time || settings?.work_end_time, "AfternoonEnd") ?? 660;
+      normalStartMins = settingToEthMinutes(settings?.afternoon_start_time, 450, "Afternoon");
+      normalEndMins = settingToEthMinutes(settings?.afternoon_end_time || settings?.work_end_time, 690, "Afternoon");
     } else {
-      normalStartMins = parseTimeToEthiopianMinutes(settings?.morning_start_time || settings?.work_start_time, "MorningStart") ?? 120;
-      normalEndMins = parseTimeToEthiopianMinutes(settings?.afternoon_end_time || settings?.work_end_time, "AfternoonEnd") ?? 660;
+      normalStartMins = settingToEthMinutes(settings?.work_start_time, 150);
+      normalEndMins = settingToEthMinutes(settings?.work_end_time, 690);
     }
 
     const inMinutes = punchToEthMinutes(checkInTimeStr, normalStartMins, session);
@@ -374,7 +344,7 @@ export class WorkCalendarService {
       // 3. Post-shift overtime (work after normal schedule and configured overtime start time):
       let postOtHours = 0;
       const configuredOtStartMins = (session === "Afternoon" || !session) && settings?.overtime_start_time
-        ? (parseTimeToEthiopianMinutes(settings.overtime_start_time, "AfternoonEnd") ?? normalEndMins)
+        ? settingToEthMinutes(settings.overtime_start_time, normalEndMins)
         : normalEndMins;
       const effectiveOtThreshold = Math.max(normalEndMins, configuredOtStartMins);
 

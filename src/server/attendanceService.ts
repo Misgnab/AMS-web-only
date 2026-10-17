@@ -1,11 +1,12 @@
 import { db } from "./database.ts";
 import { WorkCalendarService } from "./workCalendarService.ts";
-import { formatToEthiopianTime } from "../utils/ethiopianTime.ts";
 import {
-  parseTimeToEthiopianMinutes,
-  detectActiveAttendanceSession,
-  getWorkspaceShiftWindows
-} from "../utils/sessionDetection.ts";
+  formatToEthiopianTime,
+  getEthiopianTimeString,
+  parseTimeToEthMinutes,
+  determineAttendanceSession,
+  AttendanceSessionDetermination
+} from "../utils/ethiopianTime.ts";
 import type { AttendanceRecord, AttendanceCorrection, SiteSettings } from "../types.ts";
 
 export interface AttendanceExceptionItem {
@@ -229,6 +230,23 @@ export class AttendanceService {
    * In Ethiopian time format (HH:mm:ss):
    * Respects configured session start times from site_settings.
    */
+  /**
+   * Determine authoritative session dynamically based on workspace settings and current time.
+   */
+  static determineAttendanceSession(
+    siteSettingsOrWorkspaceId: any,
+    nowOrTimeStr?: Date | string | null
+  ): AttendanceSessionDetermination {
+    const settings = typeof siteSettingsOrWorkspaceId === "number"
+      ? this.getSiteSettings(siteSettingsOrWorkspaceId)
+      : (siteSettingsOrWorkspaceId || this.getSiteSettings(1));
+    return determineAttendanceSession(settings, nowOrTimeStr);
+  }
+
+  /**
+   * Evaluates lateness against scheduled shift start.
+   * Respects configured session start times from site_settings.
+   */
   static evaluateLateness(
     session: "Morning" | "Afternoon",
     ethiopianTimeStr: string,
@@ -248,9 +266,9 @@ export class AttendanceService {
       let baseStartMins = customStartMins;
       if (baseStartMins === undefined || baseStartMins === null) {
         const startStr = session === "Morning" 
-          ? (settings.morning_start_time || settings.work_start_time || "02:00") 
-          : (settings.afternoon_start_time || "07:00");
-        baseStartMins = parseTimeToEthiopianMinutes(startStr, session === "Morning" ? "MorningStart" : "AfternoonStart") ?? (session === "Morning" ? 120 : 420);
+          ? (settings.morning_start_time || settings.work_start_time || "08:30") 
+          : (settings.afternoon_start_time || "13:30");
+        baseStartMins = parseTimeToEthMinutes(startStr, session === "Morning" ? 150 : 450, session);
       }
       const graceCutoffMins = baseStartMins + effectiveGrace;
 
@@ -285,16 +303,16 @@ export class AttendanceService {
       const settings = this.getSiteSettings(workspaceId);
       const maxDurationHours = settings.max_shift_duration_hours || 14;
 
-      const morningEndEthMins = parseTimeToEthiopianMinutes(settings.morning_end_time, "MorningEnd") ?? 360;
+      const morningEndEthMins = parseTimeToEthMinutes(settings.morning_end_time || "12:30", 390, "Morning");
       const morningGrace = settings.morning_checkout_grace_minutes ?? settings.checkout_grace_minutes ?? 30;
       const morningCutoffMins = settings.morning_latest_checkout_time
-        ? (parseTimeToEthiopianMinutes(settings.morning_latest_checkout_time, "MorningCheckout") ?? (morningEndEthMins + morningGrace))
+        ? parseTimeToEthMinutes(settings.morning_latest_checkout_time, 450, "Morning")
         : (morningEndEthMins + morningGrace);
 
-      const afternoonEndEthMins = parseTimeToEthiopianMinutes(settings.afternoon_end_time || settings.work_end_time, "AfternoonEnd") ?? 660;
+      const afternoonEndEthMins = parseTimeToEthMinutes(settings.afternoon_end_time || settings.work_end_time || "17:30", 690, "Afternoon");
       const afternoonGrace = settings.afternoon_checkout_grace_minutes ?? settings.checkout_grace_minutes ?? 30;
       const afternoonCutoffMins = (settings.afternoon_latest_checkout_time || settings.latest_checkout_time)
-        ? (parseTimeToEthiopianMinutes(settings.afternoon_latest_checkout_time || settings.latest_checkout_time, "AfternoonCheckout") ?? (afternoonEndEthMins + afternoonGrace))
+        ? parseTimeToEthMinutes(settings.afternoon_latest_checkout_time || settings.latest_checkout_time, 720, "Afternoon")
         : (afternoonEndEthMins + afternoonGrace);
 
       // 1. Find all unclosed shifts from past dates (or today where elapsed time > maxDurationHours)

@@ -9,7 +9,9 @@
     "start": "node server.ts",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
-    "test": "tsc --noEmit"
+    "test": "tsc --noEmit",
+    "test:security": "tsx scripts/run-security-tests.ts",
+    "test:session": "tsx scripts/test-attendance-session.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

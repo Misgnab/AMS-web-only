@@ -136,17 +136,24 @@ function ensureColumnMigrations() {
   addCol("users", "department", "VARCHAR(100) DEFAULT 'Operations'");
   addCol("users", "created_by", "INT DEFAULT NULL");
   addCol("users", "status", "VARCHAR(50) DEFAULT 'ACTIVE'");
+  addCol("users", "is_active", "INT DEFAULT 1");
+  addCol("users", "assigned_workspaces", "TEXT DEFAULT NULL");
+  addCol("users", "custom_permissions", "TEXT DEFAULT NULL");
 
   // workspaces columns
   addCol("workspaces", "created_by", "INT DEFAULT NULL");
   addCol("workspaces", "status", "VARCHAR(50) DEFAULT 'ACTIVE'");
-  addCol("workspaces", "description", "TEXT");
+  addCol("workspaces", "description", "TEXT DEFAULT NULL");
+  addCol("workspaces", "code", "VARCHAR(50) DEFAULT NULL");
 
   // audit_logs columns
-  addCol("audit_logs", "actor_role", "VARCHAR(50)");
-  addCol("audit_logs", "target_id", "INT");
-  addCol("audit_logs", "target_type", "VARCHAR(100)");
+  addCol("audit_logs", "actor_id", "INT DEFAULT NULL");
+  addCol("audit_logs", "actor_role", "VARCHAR(50) DEFAULT NULL");
+  addCol("audit_logs", "target_type", "VARCHAR(100) DEFAULT NULL");
+  addCol("audit_logs", "target_id", "INT DEFAULT NULL");
   addCol("audit_logs", "outcome", "VARCHAR(50) DEFAULT 'SUCCESS'");
+  addCol("audit_logs", "before_value", "LONGTEXT DEFAULT NULL");
+  addCol("audit_logs", "after_value", "LONGTEXT DEFAULT NULL");
 
   // site_settings columns
   addCol("site_settings", "default_salary_calculation", "VARCHAR(50) DEFAULT 'GROSS'");
@@ -162,20 +169,15 @@ function seedInitialData() {
     const wsCount = (db.prepare("SELECT COUNT(*) as c FROM workspaces").get() as any)?.c || 0;
     if (wsCount === 0) {
       console.log("Initializing primary workspace...");
-      db.prepare("INSERT INTO workspaces (id, name, created_by, status, description) VALUES (1, 'Main Office', NULL, 'ACTIVE', 'Primary Headquarters')").run();
+      db.prepare("INSERT INTO workspaces (id, name, created_by) VALUES (1, 'Main Office', NULL)").run();
     }
 
-    // 2. Production Ready Setup:
-    // Remove uncustomized demo administrator credentials if present to prevent predictable default access
+    // 2. Production Mode: Do not seed mock accounts or fake records.
+    // Initial administrator is securely registered via /api/auth/setup-admin during initial setup.
     try {
-      db.prepare("DELETE FROM users WHERE phone_number = '0911223344' AND full_name = 'System Administrator'").run();
-    } catch (_) {}
-
-    // Ensure workspace created_by links to an active root administrator if one exists
-    try {
-      const activeAdmin: any = db.prepare("SELECT id FROM users WHERE role IN ('SuperAdmin', 'AdminCreator', 'Bootstrap') ORDER BY id ASC LIMIT 1").get();
-      if (activeAdmin?.id) {
-        db.prepare("UPDATE workspaces SET created_by = ? WHERE id = 1 AND (created_by IS NULL OR created_by = 0)").run(activeAdmin.id);
+      const firstAdmin: any = db.prepare("SELECT id FROM users WHERE role IN ('Bootstrap', 'AdminCreator', 'SuperAdmin') ORDER BY id ASC LIMIT 1").get();
+      if (firstAdmin?.id) {
+        db.prepare("UPDATE workspaces SET created_by = ? WHERE id = 1 AND (created_by IS NULL OR created_by = 0)").run(firstAdmin.id);
       }
     } catch (_) {}
 

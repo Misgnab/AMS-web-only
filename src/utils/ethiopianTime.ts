@@ -462,7 +462,363 @@ export const ETHIOPIAN_QUICK_TIMES = [
   { label: "7:30 ከሰዓት (07:30)", value: "07:30" },
   { label: "8:00 ከሰዓት (08:00)", value: "08:00" },
   { label: "10:00 ከሰዓት (10:00)", value: "10:00" },
-  { label: "11:00 ከሰዓት (11:00)", value: "11:00" },
+  { label: "11:00 ከሰዓat (11:00)", value: "11:00" },
   { label: "11:30 ከሰዓት (11:30)", value: "11:30" },
   { label: "12:00 ምሽት (12:00)", value: "12:00" }
 ];
+
+/**
+ * Authoritative Ethiopian time string (Addis Ababa timezone, 24-hr Ethiopian clock 00:00:00 - 23:59:59)
+ * Offset by 6 hours from Gregorian time in Africa/Addis_Ababa:
+ * 06:00 AM Gregorian -> 00:00 Ethiopian
+ * 12:00 PM Gregorian -> 06:00 Ethiopian
+ * 01:00 PM Gregorian -> 07:00 Ethiopian
+ * 05:00 PM Gregorian -> 11:00 Ethiopian
+ * 06:00 PM Gregorian -> 12:00 Ethiopian
+ */
+export function getEthiopianTimeString(dateInput: Date = new Date()): string {
+  try {
+    const formatter = new Intl.DateTimeFormat("en-GB", {
+      timeZone: "Africa/Addis_Ababa",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false
+    });
+    const formatted = formatter.format(dateInput);
+    const parts = formatted.split(":");
+    const h = parseInt(parts[0], 10);
+    const m = parts[1];
+    const s = parts[2];
+    const ethH = (h - 6 + 24) % 24;
+    return `${String(ethH).padStart(2, "0")}:${m}:${s}`;
+  } catch (err) {
+    const d = new Date(dateInput);
+    const h = d.getHours();
+    const ethH = (h - 6 + 24) % 24;
+    return `${String(ethH).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}:${String(d.getSeconds()).padStart(2, "0")}`;
+  }
+}
+
+/**
+ * Normalizes any configured shift time string to Ethiopian minutes from 00:00 Ethiopian (06:00 AM).
+ * Handles:
+ * 1. 24-hr Gregorian ("08:00", "08:30", "12:00", "12:30", "13:00", "13:30", "17:00", "17:30")
+ * 2. Ethiopian clock ("01:00", "02:00", "06:00", "07:00", "11:00", "12:00")
+ * 3. Prevents catastrophic double conversions (e.g. converting Ethiopian 07:00 to 01:00 AM).
+ */
+export function parseTimeToEthMinutes(
+  timeStr?: string | null,
+  defaultMins: number = 0,
+  sessionHint?: "Morning" | "Afternoon" | string
+): number {
+  if (!timeStr || typeof timeStr !== "string" || !timeStr.includes(":")) return defaultMins;
+  const parts = timeStr.trim().split(":");
+  let h = parseInt(parts[0], 10);
+  const m = parseInt(parts[1] || "0", 10);
+  if (isNaN(h)) return defaultMins;
+
+  const hint = (sessionHint || "").toLowerCase();
+  const isMorning = hint.includes("morning");
+  const isAfternoon = hint.includes("afternoon");
+
+  if (isMorning) {
+    // In morning session:
+    // Ethiopian morning: 01:00 to 06:30 (60 to 390 min).
+    // Gregorian morning: 07:00 to 12:30.
+    if (h >= 1 && h <= 6) {
+      // Already Ethiopian morning (01:00 - 06:00)
+      return h * 60 + m;
+    }
+    if (h >= 7 && h <= 12) {
+      // 24-hr Gregorian morning (07:00 - 12:00)
+      return (h - 6) * 60 + m;
+    }
+    if (h >= 6 && h <= 23) {
+      return ((h - 6 + 24) % 24) * 60 + m;
+    }
+  } else if (isAfternoon) {
+    // In afternoon session:
+    // Ethiopian afternoon: 06:00 to 12:00 (360 to 720 min, or up to 14:00 for OT).
+    // Gregorian afternoon: 12:00 to 20:00 (or up to 23:59).
+    if (h >= 12 && h <= 23) {
+      // 24-hr Gregorian afternoon (12:00, 12:30, 13:00, 17:30)
+      return (h - 6) * 60 + m;
+    }
+    if (h >= 1 && h <= 11) {
+      // Already Ethiopian afternoon (07:00 = 1 PM, 11:00 = 5 PM)
+      return h * 60 + m;
+    }
+  }
+
+  // Fallback:
+  if (h >= 6 && h <= 23) {
+    return (h - 6) * 60 + m;
+  }
+  return h * 60 + m;
+}
+
+export type AttendanceSession = "Morning" | "Afternoon";
+
+export type SessionState =
+  | "MORNING"
+  | "AFTERNOON"
+  | "BETWEEN_SHIFTS"
+  | "BEFORE_HOURS"
+  | "AFTER_HOURS"
+  | "INVALID_CONFIG";
+
+export interface AttendanceSessionDetermination {
+  activeSession: AttendanceSession | null;
+  sessionState: SessionState;
+  statusMessage: string;
+  isBetweenShifts: boolean;
+  isOutsideHours: boolean;
+  nowEthiopianTime: string;
+  nowTotalMins: number;
+  morningStartEthMins: number;
+  morningEndEthMins: number;
+  morningEarliestCheckinEthMins: number;
+  morningLatestCheckinEthMins: number;
+  afternoonStartEthMins: number;
+  afternoonEndEthMins: number;
+  afternoonEarliestCheckinEthMins: number;
+  afternoonLatestCheckinEthMins: number;
+  canCheckIn: boolean;
+  canCheckInMorning: boolean;
+  canCheckInAfternoon: boolean;
+  isWithinMorningWindow: boolean;
+  isWithinAfternoonWindow: boolean;
+  morningShiftEnded: boolean;
+  afternoonShiftEnded: boolean;
+  nextSession: AttendanceSession | null;
+  nextSessionOpensAt: string | null;
+  nextSessionOpensInMinutes: number | null;
+  blockReason?: string | null;
+}
+
+/**
+ * Formats Ethiopian minutes (from 00:00 Ethiopian / 06:00 AM) to a standard HH:mm string.
+ */
+export function formatEthMinutesToStr(totalMins: number): string {
+  const norm = ((totalMins % (24 * 60)) + 24 * 60) % (24 * 60);
+  const h = Math.floor(norm / 60);
+  const m = norm % 60;
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+}
+
+/**
+ * Authoritative Attendance Session Engine
+ * Resolves session dynamically based on workspace settings and current Ethiopian clock.
+ * Correctly distinguishes Morning session, Afternoon session, Break Between Shifts, and Outside Hours.
+ */
+export function determineAttendanceSession(
+  settings: any,
+  nowOrTimeStr?: Date | string | null
+): AttendanceSessionDetermination {
+  let nowTimeStr: string;
+  if (!nowOrTimeStr) {
+    nowTimeStr = getEthiopianTimeString(new Date());
+  } else if (nowOrTimeStr instanceof Date) {
+    nowTimeStr = getEthiopianTimeString(nowOrTimeStr);
+  } else if (typeof nowOrTimeStr === "string") {
+    if (nowOrTimeStr.includes("T")) {
+      nowTimeStr = getEthiopianTimeString(new Date(nowOrTimeStr));
+    } else if (nowOrTimeStr.includes(":")) {
+      nowTimeStr = nowOrTimeStr.trim();
+    } else {
+      nowTimeStr = getEthiopianTimeString(new Date());
+    }
+  } else {
+    nowTimeStr = getEthiopianTimeString(new Date());
+  }
+
+  const parts = nowTimeStr.split(":");
+  const nowH = parseInt(parts[0], 10) || 0;
+  const nowM = parseInt(parts[1], 10) || 0;
+  const nowTotalMins = nowH * 60 + nowM;
+
+  // 1. Morning Shift Boundaries
+  const morningStartEthMins = parseTimeToEthMinutes(
+    settings?.morning_start_time || settings?.work_start_time || "08:30",
+    150,
+    "Morning"
+  );
+  const morningEndEthMins = parseTimeToEthMinutes(
+    settings?.morning_end_time || "12:30",
+    390,
+    "Morning"
+  );
+  const morningEarliestCheckinEthMins = parseTimeToEthMinutes(
+    settings?.morning_earliest_checkin_time || settings?.earliest_checkin_time || "07:00",
+    Math.max(0, morningStartEthMins - 60),
+    "Morning"
+  );
+  const morningLatestCheckinEthMins = parseTimeToEthMinutes(
+    settings?.morning_latest_checkin_time || settings?.latest_checkin_time || "10:30",
+    morningEndEthMins,
+    "Morning"
+  );
+
+  // 2. Afternoon Shift Boundaries
+  const afternoonStartEthMins = parseTimeToEthMinutes(
+    settings?.afternoon_start_time || "13:30",
+    450,
+    "Afternoon"
+  );
+  const afternoonEndEthMins = parseTimeToEthMinutes(
+    settings?.afternoon_end_time || settings?.work_end_time || "17:30",
+    690,
+    "Afternoon"
+  );
+  const afternoonEarliestCheckinEthMins = parseTimeToEthMinutes(
+    settings?.afternoon_earliest_checkin_time || "12:30",
+    Math.max(morningEndEthMins, afternoonStartEthMins - 60),
+    "Afternoon"
+  );
+  const afternoonLatestCheckinEthMins = parseTimeToEthMinutes(
+    settings?.afternoon_latest_checkin_time || "15:30",
+    afternoonEndEthMins,
+    "Afternoon"
+  );
+
+  // Validate settings integrity safely
+  if (morningStartEthMins >= morningEndEthMins || afternoonStartEthMins >= afternoonEndEthMins) {
+    return {
+      activeSession: null,
+      sessionState: "INVALID_CONFIG",
+      statusMessage: "Shift schedule configuration error: Shift start time must precede shift end time.",
+      isBetweenShifts: false,
+      isOutsideHours: true,
+      nowEthiopianTime: nowTimeStr,
+      nowTotalMins,
+      morningStartEthMins,
+      morningEndEthMins,
+      morningEarliestCheckinEthMins,
+      morningLatestCheckinEthMins,
+      afternoonStartEthMins,
+      afternoonEndEthMins,
+      afternoonEarliestCheckinEthMins,
+      afternoonLatestCheckinEthMins,
+      canCheckIn: false,
+      canCheckInMorning: false,
+      canCheckInAfternoon: false,
+      isWithinMorningWindow: false,
+      isWithinAfternoonWindow: false,
+      morningShiftEnded: false,
+      afternoonShiftEnded: false,
+      nextSession: null,
+      nextSessionOpensAt: null,
+      nextSessionOpensInMinutes: null,
+      blockReason: "Invalid workspace schedule configuration."
+    };
+  }
+
+  const morningShiftEnded = nowTotalMins >= morningEndEthMins;
+  const afternoonShiftEnded = nowTotalMins >= afternoonEndEthMins;
+
+  // Afternoon envelope ends after checkout grace period or configured latest checkout
+  const afternoonGrace = settings?.afternoon_checkout_grace_minutes ?? settings?.checkout_grace_minutes ?? 60;
+  const afternoonLatestCheckout = settings?.afternoon_latest_checkout_time 
+    ? parseTimeToEthMinutes(settings.afternoon_latest_checkout_time, afternoonEndEthMins + afternoonGrace, "Afternoon")
+    : (afternoonEndEthMins + afternoonGrace);
+  const afternoonEnvelopeEnd = Math.max(afternoonEndEthMins + afternoonGrace, afternoonLatestCheckout);
+
+  const isWithinMorningWindow = nowTotalMins >= morningEarliestCheckinEthMins && nowTotalMins < morningEndEthMins;
+  const isWithinAfternoonWindow = nowTotalMins >= afternoonEarliestCheckinEthMins && nowTotalMins < afternoonEnvelopeEnd;
+
+  // Determine active session & state
+  let activeSession: AttendanceSession | null = null;
+  let sessionState: SessionState = "BEFORE_HOURS";
+  let isBetweenShifts = false;
+  let isOutsideHours = false;
+  let statusMessage = "";
+  let nextSession: AttendanceSession | null = null;
+  let nextSessionOpensAt: string | null = null;
+  let nextSessionOpensInMinutes: number | null = null;
+  let canCheckInMorning = false;
+  let canCheckInAfternoon = false;
+  let blockReason: string | null = null;
+
+  if (nowTotalMins < morningEarliestCheckinEthMins) {
+    // Early morning before attendance window opens
+    activeSession = null;
+    sessionState = "BEFORE_HOURS";
+    isOutsideHours = true;
+    nextSession = "Morning";
+    nextSessionOpensAt = formatEthMinutesToStr(morningEarliestCheckinEthMins);
+    nextSessionOpensInMinutes = morningEarliestCheckinEthMins - nowTotalMins;
+    statusMessage = `Morning attendance window opens at ${nextSessionOpensAt} Ethiopian time (Shift: ${formatEthMinutesToStr(morningStartEthMins)} - ${formatEthMinutesToStr(morningEndEthMins)}).`;
+    blockReason = `Attendance window has not opened yet. Morning check-in opens at ${nextSessionOpensAt}.`;
+  } else if (isWithinMorningWindow) {
+    // Morning session is active!
+    activeSession = "Morning";
+    sessionState = "MORNING";
+    canCheckInMorning = nowTotalMins <= morningLatestCheckinEthMins || nowTotalMins < morningEndEthMins;
+    statusMessage = `Morning attendance session is active (Shift: ${formatEthMinutesToStr(morningStartEthMins)} - ${formatEthMinutesToStr(morningEndEthMins)}).`;
+    nextSession = "Afternoon";
+    nextSessionOpensAt = formatEthMinutesToStr(afternoonEarliestCheckinEthMins);
+    if (!canCheckInMorning) {
+      blockReason = `Morning check-in closed at ${formatEthMinutesToStr(morningLatestCheckinEthMins)}.`;
+    }
+  } else if (nowTotalMins >= morningEndEthMins && nowTotalMins < afternoonEarliestCheckinEthMins) {
+    // Break between shifts (Midday Break / Lunch Break)!
+    activeSession = null;
+    sessionState = "BETWEEN_SHIFTS";
+    isBetweenShifts = true;
+    nextSession = "Afternoon";
+    nextSessionOpensAt = formatEthMinutesToStr(afternoonEarliestCheckinEthMins);
+    nextSessionOpensInMinutes = afternoonEarliestCheckinEthMins - nowTotalMins;
+    statusMessage = `Between Shifts: Morning session ended at ${formatEthMinutesToStr(morningEndEthMins)}. Afternoon check-in opens at ${nextSessionOpensAt} (Shift: ${formatEthMinutesToStr(afternoonStartEthMins)} - ${formatEthMinutesToStr(afternoonEndEthMins)}).`;
+    blockReason = `Between shifts: Morning shift has concluded. Afternoon check-in opens at ${nextSessionOpensAt} (${nextSessionOpensInMinutes}m remaining).`;
+  } else if (isWithinAfternoonWindow) {
+    // Afternoon session is active!
+    activeSession = "Afternoon";
+    sessionState = "AFTERNOON";
+    canCheckInAfternoon = (nowTotalMins <= afternoonLatestCheckinEthMins || nowTotalMins < afternoonEndEthMins);
+    statusMessage = `Afternoon attendance session is active (Shift: ${formatEthMinutesToStr(afternoonStartEthMins)} - ${formatEthMinutesToStr(afternoonEndEthMins)}).`;
+    if (!canCheckInAfternoon) {
+      blockReason = `Afternoon check-in closed at ${formatEthMinutesToStr(afternoonLatestCheckinEthMins)}.`;
+    }
+  } else {
+    // Past afternoon envelope (Night / Closed)
+    activeSession = null;
+    sessionState = "AFTER_HOURS";
+    isOutsideHours = true;
+    nextSession = "Morning";
+    nextSessionOpensAt = formatEthMinutesToStr(morningEarliestCheckinEthMins);
+    statusMessage = `Attendance hours for today have closed. Afternoon shift ended at ${formatEthMinutesToStr(afternoonEndEthMins)}.`;
+    blockReason = "Attendance hours for today have ended.";
+  }
+
+  const canCheckIn = activeSession === "Morning" ? canCheckInMorning : (activeSession === "Afternoon" ? canCheckInAfternoon : false);
+
+  return {
+    activeSession,
+    sessionState,
+    statusMessage,
+    isBetweenShifts,
+    isOutsideHours,
+    nowEthiopianTime: nowTimeStr,
+    nowTotalMins,
+    morningStartEthMins,
+    morningEndEthMins,
+    morningEarliestCheckinEthMins,
+    morningLatestCheckinEthMins,
+    afternoonStartEthMins,
+    afternoonEndEthMins,
+    afternoonEarliestCheckinEthMins,
+    afternoonLatestCheckinEthMins,
+    canCheckIn,
+    canCheckInMorning,
+    canCheckInAfternoon,
+    isWithinMorningWindow,
+    isWithinAfternoonWindow,
+    morningShiftEnded,
+    afternoonShiftEnded,
+    nextSession,
+    nextSessionOpensAt,
+    nextSessionOpensInMinutes,
+    blockReason
+  };
+}

@@ -1,8 +1,7 @@
 import { Request, Response, NextFunction } from "express";
-import { logAuditEvent } from "./auditService.ts";
-import { db } from "./db/databaseManager.ts";
+import { db } from "./database.js";
 
-export type Permission =
+export type AppPermission =
   | "employees.view"
   | "employees.manage"
   | "attendance.view"
@@ -27,25 +26,33 @@ export type Permission =
   | "system.settings.manage"
   | "system.audit.view";
 
-export interface AuthenticatedUser {
-  id: number;
-  phone_number: string;
-  role: string;
-  full_name: string;
-  workspace_id?: number | null;
-  status?: string;
-  hourly_rate?: number;
-  monthly_base_salary?: number;
-}
+export const ALL_PERMISSIONS: AppPermission[] = [
+  "employees.view",
+  "employees.manage",
+  "attendance.view",
+  "attendance.manage",
+  "attendance.correct",
+  "requests.view",
+  "requests.approve",
+  "payroll.view",
+  "payroll.manage",
+  "payroll.approve",
+  "penalties.view",
+  "penalties.manage",
+  "schedules.view",
+  "schedules.manage",
+  "settings.view",
+  "settings.manage",
+  "reports.view",
+  "reports.export",
+  "audit.view",
+  "workspaces.manage",
+  "admins.manage",
+  "system.settings.manage",
+  "system.audit.view"
+];
 
-export interface AuthenticatedRequest extends Request {
-  user?: AuthenticatedUser;
-}
-
-/**
- * Role-Based Permission Matrix
- */
-export const ROLE_PERMISSIONS: Record<string, Permission[]> = {
+export const ROLE_DEFAULT_PERMISSIONS: Record<string, AppPermission[]> = {
   SuperAdmin: [
     "employees.view",
     "employees.manage",
@@ -100,31 +107,9 @@ export const ROLE_PERMISSIONS: Record<string, Permission[]> = {
     "attendance.correct",
     "requests.view",
     "requests.approve",
-    "payroll.view",
     "penalties.view",
     "penalties.manage",
     "schedules.view",
-    "settings.view",
-    "reports.view",
-    "reports.export",
-    "audit.view"
-  ],
-  Admin: [
-    "employees.view",
-    "employees.manage",
-    "attendance.view",
-    "attendance.manage",
-    "attendance.correct",
-    "requests.view",
-    "requests.approve",
-    "payroll.view",
-    "payroll.manage",
-    "penalties.view",
-    "penalties.manage",
-    "schedules.view",
-    "schedules.manage",
-    "settings.view",
-    "settings.manage",
     "reports.view",
     "reports.export",
     "audit.view"
@@ -132,197 +117,153 @@ export const ROLE_PERMISSIONS: Record<string, Permission[]> = {
   HR: [
     "employees.view",
     "attendance.view",
-    "attendance.correct",
+    "attendance.manage",
     "requests.view",
     "requests.approve",
     "penalties.view",
-    "schedules.view",
-    "reports.view",
-    "audit.view"
+    "reports.view"
   ],
   Accountant: [
+    "employees.view",
     "payroll.view",
     "payroll.manage",
-    "payroll.approve",
-    "penalties.view",
     "reports.view",
     "reports.export"
   ],
   Bootstrap: [
-    "workspaces.manage",
-    "admins.manage"
+    "admins.manage",
+    "system.settings.manage"
   ],
-  Employee: [],
-  Purchaser: [],
-  Engineer: []
+  Employee: [
+    "attendance.view",
+    "requests.view",
+    "payroll.view"
+  ],
+  Purchaser: [
+    "attendance.view",
+    "requests.view",
+    "payroll.view"
+  ],
+  Engineer: [
+    "attendance.view",
+    "requests.view",
+    "payroll.view"
+  ]
 };
 
-/**
- * Checks whether a role possesses a specific permission.
- * SuperAdmin possesses all permissions.
- */
-export function hasPermission(role?: string, permission?: Permission): boolean {
-  if (!role || !permission) return false;
-  if (role === "SuperAdmin") return true;
-  const list = ROLE_PERMISSIONS[role];
-  return Array.isArray(list) && list.includes(permission);
-}
-
-export function isSuperAdmin(user?: AuthenticatedUser | null): boolean {
-  return user?.role === "SuperAdmin";
-}
-
-export function isWorkspaceAdmin(user?: AuthenticatedUser | null): boolean {
-  return ["AdminCreator", "AdminManager", "Admin", "SuperAdmin"].includes(user?.role || "");
-}
-
-export function isStaffManager(user?: AuthenticatedUser | null): boolean {
-  return ["AdminCreator", "AdminManager", "Admin", "SuperAdmin", "HR", "Accountant"].includes(user?.role || "");
+export interface UserAuthContext {
+  id: number;
+  role: string;
+  phone_number?: string;
+  full_name?: string;
+  workspace_id?: number | null;
+  status?: string;
+  is_active?: number;
+  custom_permissions?: string | null;
 }
 
 /**
- * Derives the trusted authorized workspace ID for a request.
- * - SuperAdmin can view any workspace; if a workspace query/body parameter is passed, use it.
- * - Non-SuperAdmin is STRICTLY constrained to their database-assigned workspace.
- *   Client-supplied workspace IDs are NEVER trusted as proof of authorization.
+ * Checks whether a user possesses a specific permission.
  */
-export function getAuthorizedWorkspaceId(req: AuthenticatedRequest, requestedWsId?: any): number {
-  if (isSuperAdmin(req.user)) {
-    if (requestedWsId !== undefined && requestedWsId !== null && requestedWsId !== "" && requestedWsId !== "all") {
-      const parsed = parseInt(String(requestedWsId), 10);
-      if (!isNaN(parsed) && parsed > 0) return parsed;
-    }
-    return req.user?.workspace_id || 1;
-  }
-  return req.user?.workspace_id || 1;
-}
-
-/**
- * Returns all workspace IDs assigned to a user (primary workspace + any in workspace_assignments)
- */
-export function getAuthorizedWorkspaceIds(userId?: number, primaryWsId?: number | null): number[] {
-  const ids: number[] = [];
-  if (primaryWsId) ids.push(Number(primaryWsId));
-  if (!userId) return ids.length > 0 ? ids : [1];
-  try {
-    const rows = db.prepare("SELECT workspace_id FROM workspace_assignments WHERE user_id = ?").all(userId) as any[];
-    if (rows && rows.length > 0) {
-      for (const r of rows) {
-        const id = Number(r.workspace_id);
-        if (id && !ids.includes(id)) {
-          ids.push(id);
-        }
-      }
-    }
-  } catch (_) {}
-  return ids.length > 0 ? ids : [1];
-}
-
-/**
- * Validates that an operation targets the authenticated user's authorized workspace.
- * Returns true if authorized, false otherwise.
- */
-export function validateWorkspaceAccess(req: AuthenticatedRequest, resourceWorkspaceId?: number | null): boolean {
-  if (isSuperAdmin(req.user)) return true;
-  if (!req.user?.workspace_id) return false;
-  if (resourceWorkspaceId === undefined || resourceWorkspaceId === null) return true;
-  const target = Number(resourceWorkspaceId);
-  const primary = Number(req.user.workspace_id);
-  if (target === primary) return true;
-  const authorizedIds = getAuthorizedWorkspaceIds(req.user.id, primary);
-  return authorizedIds.includes(target);
-}
-
-/**
- * Middleware: Requires a specific permission on the backend.
- */
-export function requirePermission(permission: Permission) {
-  return (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
-    const role = req.user?.role;
-    if (!role) {
-      return res.status(401).json({ error: "Authentication required.", code: "AUTH_REQUIRED" });
-    }
-    if (!hasPermission(role, permission)) {
-      logAuditEvent({
-        workspaceId: req.user?.workspace_id,
-        userId: req.user?.id,
-        actorRole: role,
-        action: "UNAUTHORIZED_PERMISSION_ATTEMPT",
-        details: `Access denied: role '${role}' attempted action requiring '${permission}' on path ${req.originalUrl}`,
-        outcome: "DENIED",
-        ipAddress: req.ip || (req.headers["x-forwarded-for"] as string) || "127.0.0.1"
-      });
-      return res.status(403).json({
-        error: `Access denied. Permission '${permission}' is required.`,
-        code: "PERMISSION_DENIED",
-        requiredPermission: permission
-      });
-    }
-    next();
-  };
-}
-
-/**
- * Middleware: Requires SuperAdmin role.
- */
-export function requireSuperAdmin(req: AuthenticatedRequest, res: Response, next: NextFunction) {
-  if (!isSuperAdmin(req.user)) {
-    logAuditEvent({
-      workspaceId: req.user?.workspace_id,
-      userId: req.user?.id,
-      actorRole: req.user?.role,
-      action: "SUPERADMIN_ACCESS_DENIED",
-      details: `Non-SuperAdmin (${req.user?.full_name}, role: ${req.user?.role}) attempted accessing SuperAdmin endpoint ${req.originalUrl}`,
-      outcome: "DENIED",
-      ipAddress: req.ip || (req.headers["x-forwarded-for"] as string) || "127.0.0.1"
-    });
-    return res.status(403).json({
-      error: "Access denied. Only Super Administrators can perform this action.",
-      code: "SUPERADMIN_REQUIRED"
-    });
-  }
-  next();
-}
-
-/**
- * Helper: Enforces that a resource belongs to the user's workspace.
- * If cross-workspace IDOR is detected, responds with 403 and writes an audit event.
- * Returns true if authorized, false if response was sent.
- */
-export function enforceWorkspaceScope(
-  req: AuthenticatedRequest,
-  res: Response,
-  resourceWorkspaceId: number | null | undefined,
-  entityName: string = "record"
-): boolean {
-  if (isSuperAdmin(req.user)) return true;
+export function hasPermission(user: UserAuthContext | undefined, permission: AppPermission): boolean {
+  if (!user) return false;
   
-  const userWsId = req.user?.workspace_id || 1;
-  const targetWsId = resourceWorkspaceId !== undefined && resourceWorkspaceId !== null ? Number(resourceWorkspaceId) : userWsId;
+  // Suspended or inactive users have zero permissions
+  if (user.status === "SUSPENDED" || user.is_active === 0) return false;
 
-  if (targetWsId !== userWsId) {
-    const authorizedIds = getAuthorizedWorkspaceIds(req.user?.id, userWsId);
-    if (authorizedIds.includes(targetWsId)) {
-      return true;
+  // SuperAdmin has all permissions globally
+  if (user.role === "SuperAdmin") return true;
+
+  // Check custom permission overrides if set
+  if (user.custom_permissions) {
+    try {
+      const customList: string[] = JSON.parse(user.custom_permissions);
+      if (Array.isArray(customList) && customList.includes(permission)) {
+        return true;
+      }
+    } catch (_) {
+      // Ignore JSON parse errors and fallback to role defaults
     }
-
-    logAuditEvent({
-      workspaceId: userWsId,
-      userId: req.user?.id,
-      actorRole: req.user?.role,
-      action: "CROSS_WORKSPACE_IDOR_BLOCKED",
-      details: `Cross-workspace IDOR attempt blocked: User ${req.user?.full_name} (#${req.user?.id}, Workspace ${userWsId}) attempted to access ${entityName} belonging to Workspace ${targetWsId} at ${req.originalUrl}`,
-      targetId: targetWsId,
-      targetType: entityName,
-      outcome: "DENIED",
-      ipAddress: req.ip || (req.headers["x-forwarded-for"] as string) || "127.0.0.1"
-    });
-
-    res.status(403).json({
-      error: `Access denied. Cross-workspace access to ${entityName} is strictly forbidden.`,
-      code: "WORKSPACE_ISOLATION_VIOLATION"
-    });
-    return false;
   }
-  return true;
+
+  const rolePerms = ROLE_DEFAULT_PERMISSIONS[user.role] || [];
+  return rolePerms.includes(permission);
+}
+
+/**
+ * Extracts client IP address safely
+ */
+export function getClientIp(req: Request): string {
+  const forwarded = req.headers["x-forwarded-for"];
+  if (typeof forwarded === "string") {
+    return forwarded.split(",")[0].trim();
+  }
+  return req.socket.remoteAddress || "127.0.0.1";
+}
+
+export interface AuditLogEntry {
+  workspaceId?: number | null;
+  userId?: number | null;
+  actorRole?: string | null;
+  action: string;
+  details?: string | null;
+  targetType?: string | null;
+  targetId?: number | null;
+  outcome?: "SUCCESS" | "FAILURE" | "DENIED" | "SUSPICIOUS";
+  ipAddress?: string | null;
+  beforeValue?: any;
+  afterValue?: any;
+}
+
+/**
+ * Centralized audit logging utility. Never fails, safely records system and user operations.
+ */
+export function recordAuditLog(entry: AuditLogEntry): void {
+  try {
+    const sanitize = (val: any): string | null => {
+      if (val === undefined || val === null) return null;
+      if (typeof val === "string") return val;
+      try {
+        const copy = JSON.parse(JSON.stringify(val));
+        // Redact any password or token fields
+        if (typeof copy === "object" && copy !== null) {
+          if (copy.password) copy.password = "[REDACTED]";
+          if (copy.token) copy.token = "[REDACTED]";
+          if (copy.current_password) copy.current_password = "[REDACTED]";
+          if (copy.new_password) copy.new_password = "[REDACTED]";
+        }
+        return JSON.stringify(copy);
+      } catch (_) {
+        return String(val);
+      }
+    };
+
+    const beforeStr = sanitize(entry.beforeValue);
+    const afterStr = sanitize(entry.afterValue);
+    const outcome = entry.outcome || "SUCCESS";
+
+    db.prepare(`
+      INSERT INTO audit_logs (
+        workspace_id, user_id, actor_id, actor_role,
+        action, details, ip_address,
+        target_type, target_id, outcome,
+        before_value, after_value
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      entry.workspaceId ?? null,
+      entry.userId ?? null,
+      entry.userId ?? null,
+      entry.actorRole ?? null,
+      entry.action,
+      entry.details ?? null,
+      entry.ipAddress ?? null,
+      entry.targetType ?? null,
+      entry.targetId ?? null,
+      outcome,
+      beforeStr,
+      afterStr
+    );
+  } catch (err: any) {
+    console.error("[AuditLog] Failed to record audit log:", err?.message || err);
+  }
 }

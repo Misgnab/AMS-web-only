@@ -190,7 +190,9 @@ export const WorkingDayStatusCard: React.FC<WorkingDayStatusCardProps> = ({
             <div className="flex items-center gap-1.5 min-w-0">
               <Sun size={13} className="text-amber-500 shrink-0" />
               <div className="min-w-0">
-                <span className="text-[10px] uppercase font-bold text-slate-400 block leading-none">Morning (02:00 - 06:00)</span>
+                <span className="text-[10px] uppercase font-bold text-slate-400 block leading-none">
+                  Morning ({status?.schedule?.morning_start || mStartEth || "02:00"} - {status?.schedule?.morning_end || mEndEth || "06:00"})
+                </span>
                 <span className={`text-[11px] font-bold truncate block ${
                   !isWorking ? "text-amber-700" : "text-emerald-700"
                 }`}>
@@ -212,7 +214,9 @@ export const WorkingDayStatusCard: React.FC<WorkingDayStatusCardProps> = ({
             <div className="flex items-center gap-1.5 min-w-0">
               <Moon size={13} className="text-indigo-500 shrink-0" />
               <div className="min-w-0">
-                <span className="text-[10px] uppercase font-bold text-slate-400 block leading-none">Afternoon (07:00 - 11:00)</span>
+                <span className="text-[10px] uppercase font-bold text-slate-400 block leading-none">
+                  Afternoon ({status?.schedule?.afternoon_start || aStartEth || "07:00"} - {status?.schedule?.afternoon_end || aEndEth || "11:00"})
+                </span>
                 <span className={`text-[11px] font-bold truncate block ${
                   !isWorking || isSaturday ? "text-amber-700" : "text-emerald-700"
                 }`}>

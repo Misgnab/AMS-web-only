@@ -285,8 +285,18 @@ export interface AttendanceStatusResponse {
   openTodayRecord: AttendanceRecord | null;
   hasMissingCheckout: boolean;
   missingRecords: AttendanceRecord[];
+  activeSession?: "Morning" | "Afternoon" | null;
+  sessionState?: "MORNING" | "AFTERNOON" | "BETWEEN_SHIFTS" | "BEFORE_HOURS" | "AFTER_HOURS" | "INVALID_CONFIG";
+  sessionInfo?: any;
   canCheckIn: boolean;
   canCheckOut: boolean;
+  canCheckInMorning?: boolean;
+  canCheckInAfternoon?: boolean;
+  isBetweenShifts?: boolean;
+  isOutsideHours?: boolean;
+  nextSession?: "Morning" | "Afternoon" | null;
+  nextSessionOpensAt?: string | null;
+  blockReason?: string | null;
   todayDate: string;
   currentTime: string;
   serverEpochMs?: number;
@@ -855,3 +865,66 @@ export interface LatePenaltyPolicy {
   morning_start_time?: string;
   afternoon_start_time?: string;
 }
+
+export interface WorkspaceItem {
+  id: number;
+  name: string;
+  code?: string | null;
+  status: "ACTIVE" | "INACTIVE";
+  description?: string | null;
+  created_by?: number | null;
+  created_by_name?: string | null;
+  created_at: string;
+  updated_at?: string;
+  admin_count?: number;
+  employee_count?: number;
+  today_attendance_count?: number;
+}
+
+export interface WorkspaceAdminUser {
+  id: number;
+  full_name: string;
+  phone_number: string;
+  role: "SuperAdmin" | "AdminCreator" | "AdminManager" | "HR" | "Accountant" | "Bootstrap";
+  status: "ACTIVE" | "SUSPENDED";
+  is_active: number;
+  workspace_id: number | null;
+  workspace_name?: string | null;
+  registration_date?: string;
+  created_by?: number | null;
+  created_by_name?: string | null;
+  department?: string;
+  photo?: string | null;
+}
+
+export interface SuperAdminAuditLog {
+  id: number;
+  workspace_id?: number | null;
+  workspace_name?: string | null;
+  user_id?: number | null;
+  actor_id?: number | null;
+  actor_name?: string | null;
+  actor_role?: string | null;
+  action: string;
+  details?: string | null;
+  ip_address?: string | null;
+  outcome?: string | null;
+  target_type?: string | null;
+  target_id?: number | null;
+  before_value?: string | null;
+  after_value?: string | null;
+  created_at: string;
+}
+
+export interface SuperAdminOverviewStats {
+  totalWorkspaces: number;
+  activeWorkspaces: number;
+  inactiveWorkspaces: number;
+  totalAdmins: number;
+  activeAdmins: number;
+  suspendedAdmins: number;
+  totalEmployees: number;
+  todayAttendanceAcrossWorkspaces: number;
+  securityEventsCount: number;
+}
+

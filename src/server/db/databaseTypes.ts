@@ -1,4 +1,4 @@
-export type DatabaseEngine = "mysql";
+export type DatabaseEngine = "mysql" | "sqlite";
 
 export interface PreparedStatement {
   get(...params: any[]): any;

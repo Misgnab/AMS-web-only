@@ -11,7 +11,7 @@ import type {
   DatabaseEngine
 } from "./databaseTypes.ts";
 import { MysqlDriver } from "./mysqlDriver.ts";
-import { MemoryDriver } from "./memoryDriver.ts";
+import { SqliteDriver } from "./sqliteDriver.ts";
 import { DATABASE_TABLE_ORDER, generateMysqlSchemaSql } from "./mysqlSchema.ts";
 import { ensureMysqlRunning } from "./mysqlDaemon.ts";
 
@@ -45,7 +45,7 @@ function getResolvedConfigPath(): string {
 export class DatabaseManager implements IDatabaseDriver {
   public name: DatabaseEngine = "mysql";
   private mysqlDriver: MysqlDriver;
-  private memoryDriver: MemoryDriver;
+  private sqliteDriver: SqliteDriver;
   private activeDriver: IDatabaseDriver;
   private effectiveEngine: DatabaseEngine = "mysql";
   private isFallback = false;
@@ -63,12 +63,12 @@ export class DatabaseManager implements IDatabaseDriver {
       ensureMysqlRunning();
     } catch (_) {}
 
-    // 3. Initialize MySQL driver and in-memory mock driver
+    // 3. Initialize drivers
     this.mysqlDriver = new MysqlDriver();
-    this.memoryDriver = new MemoryDriver();
-    this.activeDriver = this.memoryDriver;
+    this.sqliteDriver = new SqliteDriver();
+    this.activeDriver = this.mysqlDriver;
 
-    // 4. Connect to MySQL or fall back to MemoryDriver
+    // 4. Connect to database
     this.connect();
   }
 
@@ -87,9 +87,6 @@ export class DatabaseManager implements IDatabaseDriver {
 
   private startReconnectLoop(): void {
     if (this.reconnectTimer) return;
-    if (["127.0.0.1", "localhost"].includes(this.config.mysql.host)) {
-      return;
-    }
     this.reconnectTimer = setInterval(() => {
       if (this.mysqlDriver.isReady() && this.effectiveEngine === "mysql") {
         if (this.reconnectTimer) {
@@ -99,7 +96,10 @@ export class DatabaseManager implements IDatabaseDriver {
         return;
       }
       this.tryReconnect();
-    }, 10000);
+    }, 15000);
+    if (this.reconnectTimer && typeof this.reconnectTimer.unref === "function") {
+      this.reconnectTimer.unref();
+    }
   }
 
   public tryReconnect(): boolean {
@@ -183,17 +183,28 @@ export class DatabaseManager implements IDatabaseDriver {
       this.notifyConnected();
       return true;
     } else {
-      this.activeDriver = this.memoryDriver;
-      this.effectiveEngine = "mysql";
-      this.isFallback = true;
-      this.name = "mysql";
-      console.log(`[DatabaseManager] MySQL connection unavailable (${this.mysqlDriver.getLastError()}). In-Memory Mock Database Driver active.`);
-      try {
-        this.memoryDriver.initSchema();
-      } catch (_) {}
-      this.notifyConnected();
+      console.warn(`[DatabaseManager] MySQL connection unavailable (${this.mysqlDriver.getLastError()}). Falling back to local SQLite engine.`);
+      const sqliteOk = this.sqliteDriver.init();
+      if (sqliteOk) {
+        try {
+          this.sqliteDriver.initSchema();
+        } catch (err) {
+          console.warn("[DatabaseManager] SQLite initSchema warning:", err);
+        }
+        this.activeDriver = this.sqliteDriver;
+        this.effectiveEngine = "sqlite";
+        this.isFallback = true;
+        this.name = "sqlite";
+        console.log(`[DatabaseManager] Connected to SQLite database.`);
+        this.notifyConnected();
+      } else {
+        this.activeDriver = this.mysqlDriver;
+        this.effectiveEngine = "mysql";
+        this.isFallback = false;
+        this.name = "mysql";
+      }
       this.startReconnectLoop();
-      return true;
+      return this.isReady();
     }
   }
 
@@ -202,7 +213,7 @@ export class DatabaseManager implements IDatabaseDriver {
       try {
         this.activeDriver.initSchema();
       } catch (e: any) {
-        console.warn("[DatabaseManager] Schema initialization warning:", e.message);
+        console.warn("[DatabaseManager] schema warning:", e.message);
       }
     }
   }
@@ -312,7 +323,7 @@ export class DatabaseManager implements IDatabaseDriver {
 
     return {
       activeEngine: "mysql",
-      effectiveEngine: "mysql",
+      effectiveEngine: this.effectiveEngine,
       isFallback: this.isFallback,
       mysql: mysqlStatus,
       tables: [...DATABASE_TABLE_ORDER]

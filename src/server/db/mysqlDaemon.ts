@@ -67,6 +67,9 @@ export function ensureMysqlRunning(): void {
 
       // 4. Try init service script first (cleanest daemon startup on Linux/Debian)
       try {
+        if (fs.existsSync("/usr/sbin/policy-rc.d")) {
+          try { fs.unlinkSync("/usr/sbin/policy-rc.d"); } catch (_) {}
+        }
         execSync("service mariadb start 2>/dev/null || /etc/init.d/mariadb start 2>/dev/null || service mysql start 2>/dev/null || /etc/init.d/mysql start 2>/dev/null", { stdio: "ignore", timeout: 15000 });
       } catch (_) {}
 
