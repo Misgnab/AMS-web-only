@@ -16,6 +16,7 @@ import { SalaryManagementTab } from "./components/SalaryManagementTab";
 import { WorkingDayStatusCard } from "./components/WorkingDayStatusCard";
 import { AttendanceScheduleSettingsTab } from "./components/AttendanceScheduleSettingsTab";
 import { SuperAdminManagementTab } from "./components/SuperAdminManagementTab";
+import { SelectSiteToVisit } from "./components/SelectSiteToVisit";
 import { useRealtimeSync } from "./utils/useRealtimeSync";
 import { OfflineIndicator } from "./components/OfflineIndicator";
 import { EnterprisePayslip, SalaryPayment, User } from "./types";
@@ -26,6 +27,7 @@ import { getOrCreateDeviceId, getDeviceDisplayName } from "./utils/security.js";
 import { useNetworkTime, getNetworkDate } from "./utils/networkTime.js";
 import { 
   Briefcase, 
+  Building2,
   Calendar, 
   CalendarCheck,
   CheckCircle, 
@@ -65,6 +67,7 @@ import {
   ShieldAlert,
   Zap,
   Compass,
+  Eye,
   Copy,
   Edit2,
   Printer,
@@ -154,7 +157,14 @@ export default function App() {
     disburseSalary,
     updateCompensation,
     mySalary,
-    fetchMySalary
+    fetchMySalary,
+    visitingWorkspace,
+    visitingWorkspaceId,
+    sitesSummary,
+    fetchSitesSummary,
+    visitSite,
+    leaveSite,
+    switchSite
   } = useAppStore();
 
   // Real-time synchronization via Server-Sent Events (SSE)
@@ -632,6 +642,9 @@ export default function App() {
           fetchOvertimeStats();
           fetchOvertimeRecords();
           fetchPenalties();
+          if (currentUser.role === "SuperAdmin") {
+            fetchSitesSummary();
+          }
         }
       });
     }
@@ -3053,16 +3066,25 @@ MYSQL_DATABASE=your_db_name`}
           <div className="min-w-0 flex-1">
             <h1 className="text-xs sm:text-sm md:text-lg font-bold tracking-tight flex items-center gap-1.5 truncate">
               <span className="truncate">{user.full_name}</span>
-              {user.workspace_name && (
+              {user.role === "SuperAdmin" && visitingWorkspace ? (
+                <span className="text-[9px] md:text-[10px] bg-amber-500/25 border border-amber-400/50 text-amber-300 px-2 py-0.5 rounded font-black uppercase tracking-wider shrink-0 flex items-center gap-1">
+                  <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
+                  Visiting: {visitingWorkspace.name}
+                </span>
+              ) : user.workspace_name ? (
                 <span className="text-[9px] md:text-[10px] bg-blue-500/20 text-blue-300 px-1.5 py-0.5 rounded font-black uppercase tracking-wider shrink-0 hidden xs:inline-block">
                   {user.workspace_name}
                 </span>
-              )}
+              ) : null}
             </h1>
             <p className="text-[10px] md:text-xs text-slate-400 font-medium flex items-center gap-1.5 truncate">
-              <span className="truncate">{siteSettings?.office_name || "Nabi Tech PLC Attendance Panel"}</span>
-              <span className="text-slate-500 shrink-0 hidden sm:inline">({user.role === "AdminManager" ? "Second Admin" : user.role === "AdminCreator" ? "Normal Admin" : user.role})</span>
-              {["SuperAdmin", "AdminCreator", "AdminManager", "Bootstrap"].includes(user.role || "") && (
+              <span className="truncate">
+                {visitingWorkspace ? `Active Site: ${visitingWorkspace.name} (ID #${visitingWorkspace.id})` : (siteSettings?.office_name || "Nabi Tech PLC Attendance Panel")}
+              </span>
+              <span className="text-slate-500 shrink-0 hidden sm:inline">
+                ({user.role === "AdminManager" ? "Second Admin" : user.role === "AdminCreator" ? "Normal Admin" : user.role})
+              </span>
+              {["SuperAdmin", "AdminCreator", "AdminManager", "Bootstrap"].includes(user.role || "") && !visitingWorkspace && (
                 <button
                   type="button"
                   onClick={() => {
@@ -3100,6 +3122,44 @@ MYSQL_DATABASE=your_db_name`}
             <span className="font-mono font-bold text-slate-100">{getEthiopianLocalClockTimeString(currentTime)}</span>
             <span className="text-[10px] text-amber-400 font-bold uppercase tracking-wider pl-1 border-l border-slate-700">{getEthiopianTimePeriod(currentTime).split(" ")[0]}</span>
           </div>
+
+          {/* Super Admin Quick Site Switcher in Header */}
+          {user.role === "SuperAdmin" && (
+            <div className="relative shrink-0">
+              <select
+                aria-label="Active Workspace Context"
+                value={visitingWorkspaceId || "all"}
+                onChange={async (e) => {
+                  const val = e.target.value;
+                  if (val === "all") {
+                    await leaveSite();
+                    setActiveTab("select_site");
+                  } else {
+                    const sid = parseInt(val, 10);
+                    if (!isNaN(sid) && sid > 0) {
+                      await switchSite(sid);
+                      setActiveTab("dashboard");
+                    }
+                  }
+                }}
+                className={`text-[11px] font-bold rounded-xl px-2 sm:px-2.5 py-1.5 border transition cursor-pointer shadow-xs min-h-[36px] focus:outline-none focus:ring-2 max-w-[140px] sm:max-w-[200px] truncate ${
+                  visitingWorkspace
+                    ? "bg-amber-500/20 border-amber-400/60 text-amber-200 focus:ring-amber-400/40"
+                    : "bg-slate-800/80 border-slate-700 text-slate-300 hover:bg-slate-700/80 focus:ring-indigo-500/40"
+                }`}
+                title="Super Admin Workspace Selector: Switch active site context"
+              >
+                <option value="all" className="bg-slate-900 text-white font-bold">
+                  {visitingWorkspace ? "← Return to Super Admin" : "🌐 Global Super Admin View"}
+                </option>
+                {sitesSummary.map((site) => (
+                  <option key={site.id} value={site.id} className="bg-slate-900 text-white font-medium">
+                    {site.id === visitingWorkspaceId ? "✓ " : ""}Site #{site.id}: {site.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
 
           {/* Live Real-Time SSE Sync Indicator */}
           <button
@@ -3270,18 +3330,32 @@ MYSQL_DATABASE=your_db_name`}
                 {user?.role !== "Bootstrap" && (
                   <>
                     {user?.role === "SuperAdmin" && (
-                      <button
-                        onClick={() => { setActiveTab("super_admin"); setIsMobileMenuOpen(false); }}
-                        className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-sm font-bold text-left transition cursor-pointer ${
-                          activeTab === "super_admin" ? "bg-indigo-600 text-white shadow-xs" : "bg-indigo-50 text-indigo-700 hover:bg-indigo-100"
-                        }`}
-                      >
-                        <ShieldCheck size={18} className={activeTab === "super_admin" ? "text-white" : "text-indigo-600"} />
-                        <span>Super Admin Hub</span>
-                        <span className="ml-auto px-1.5 py-0.2 bg-indigo-200 text-indigo-900 text-[9px] rounded-full font-black uppercase">
-                          Global
-                        </span>
-                      </button>
+                      <>
+                        <button
+                          onClick={() => { setActiveTab("select_site"); setIsMobileMenuOpen(false); }}
+                          className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-sm font-bold text-left transition cursor-pointer ${
+                            activeTab === "select_site" ? "bg-amber-600 text-white shadow-xs" : "bg-amber-50 text-amber-800 hover:bg-amber-100"
+                          }`}
+                        >
+                          <Building2 size={18} className={activeTab === "select_site" ? "text-white" : "text-amber-600"} />
+                          <span>Select Site to Visit</span>
+                          <span className="ml-auto px-1.5 py-0.2 bg-amber-200 text-amber-900 text-[9px] rounded-full font-black uppercase">
+                            Sites
+                          </span>
+                        </button>
+                        <button
+                          onClick={() => { setActiveTab("super_admin"); setIsMobileMenuOpen(false); }}
+                          className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-sm font-bold text-left transition cursor-pointer ${
+                            activeTab === "super_admin" ? "bg-indigo-600 text-white shadow-xs" : "bg-indigo-50 text-indigo-700 hover:bg-indigo-100"
+                          }`}
+                        >
+                          <ShieldCheck size={18} className={activeTab === "super_admin" ? "text-white" : "text-indigo-600"} />
+                          <span>Super Admin Hub</span>
+                          <span className="ml-auto px-1.5 py-0.2 bg-indigo-200 text-indigo-900 text-[9px] rounded-full font-black uppercase">
+                            Global
+                          </span>
+                        </button>
+                      </>
                     )}
                     <button
                       onClick={() => { setActiveTab("dashboard"); setIsMobileMenuOpen(false); }}
@@ -3467,18 +3541,32 @@ MYSQL_DATABASE=your_db_name`}
                 {user?.role !== "Bootstrap" && (
                   <>
                     {user?.role === "SuperAdmin" && (
-                      <button
-                        onClick={() => setActiveTab("super_admin")}
-                        className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-sm font-bold text-left transition cursor-pointer ${
-                          activeTab === "super_admin" ? "bg-indigo-600 text-white shadow-xs" : "bg-indigo-50 text-indigo-700 hover:bg-indigo-100"
-                        }`}
-                      >
-                        <ShieldCheck size={18} className={activeTab === "super_admin" ? "text-white" : "text-indigo-600"} />
-                        <span>Super Admin Hub</span>
-                        <span className="ml-auto px-1.5 py-0.2 bg-indigo-200 text-indigo-900 text-[9px] rounded-full font-black uppercase">
-                          Global
-                        </span>
-                      </button>
+                      <>
+                        <button
+                          onClick={() => setActiveTab("select_site")}
+                          className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-sm font-bold text-left transition cursor-pointer ${
+                            activeTab === "select_site" ? "bg-amber-600 text-white shadow-xs" : "bg-amber-50 text-amber-800 hover:bg-amber-100"
+                          }`}
+                        >
+                          <Building2 size={18} className={activeTab === "select_site" ? "text-white" : "text-amber-600"} />
+                          <span>Select Site to Visit</span>
+                          <span className="ml-auto px-1.5 py-0.2 bg-amber-200 text-amber-900 text-[9px] rounded-full font-black uppercase">
+                            Sites
+                          </span>
+                        </button>
+                        <button
+                          onClick={() => setActiveTab("super_admin")}
+                          className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-sm font-bold text-left transition cursor-pointer ${
+                            activeTab === "super_admin" ? "bg-indigo-600 text-white shadow-xs" : "bg-indigo-50 text-indigo-700 hover:bg-indigo-100"
+                          }`}
+                        >
+                          <ShieldCheck size={18} className={activeTab === "super_admin" ? "text-white" : "text-indigo-600"} />
+                          <span>Super Admin Hub</span>
+                          <span className="ml-auto px-1.5 py-0.2 bg-indigo-200 text-indigo-900 text-[9px] rounded-full font-black uppercase">
+                            Global
+                          </span>
+                        </button>
+                      </>
                     )}
                     <button
                       onClick={() => setActiveTab("dashboard")}
@@ -3637,6 +3725,85 @@ MYSQL_DATABASE=your_db_name`}
         {/* Content Panel */}
         <main className="flex-1 p-4 md:p-8 overflow-y-auto min-h-0 space-y-6">
           
+          {/* Super Admin Visiting Site Active Context Banner */}
+          {user?.role === "SuperAdmin" && visitingWorkspace && (
+            <div className="bg-gradient-to-r from-amber-500 via-amber-600 to-amber-700 text-slate-950 rounded-2xl p-4 md:p-5 shadow-lg border-2 border-amber-400 relative overflow-hidden">
+              <div className="flex flex-col lg:flex-row items-start lg:items-center justify-between gap-4 relative z-10">
+                <div className="flex items-center gap-3.5">
+                  <div className="w-12 h-12 rounded-xl bg-slate-950 text-amber-400 flex items-center justify-center font-black shadow-inner shrink-0">
+                    <Building2 size={24} />
+                  </div>
+                  <div>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="text-[10px] font-black tracking-wider uppercase bg-slate-950 text-amber-400 px-2 py-0.5 rounded">
+                        SUPER ADMIN — VISITING
+                      </span>
+                      <span className="text-xs font-bold text-slate-900 bg-white/70 px-2 py-0.5 rounded font-mono">
+                        Site ID #{visitingWorkspace.id}
+                      </span>
+                      <span className="inline-flex items-center gap-1 text-[11px] font-bold text-emerald-950 bg-emerald-300/90 px-2 py-0.5 rounded">
+                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-700 animate-pulse" />
+                        Active Administrative Context
+                      </span>
+                    </div>
+                    <h2 className="text-lg md:text-xl font-black text-slate-950 mt-1 tracking-tight">
+                      {visitingWorkspace.name}
+                    </h2>
+                    <p className="text-xs text-slate-900 font-medium">
+                      Managing site activities, employees, attendance, payroll, settings, and reports with full Super Admin authority.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-2.5 flex-wrap w-full lg:w-auto">
+                  {/* Direct Site Switcher Dropdown */}
+                  {sitesSummary.length > 1 && (
+                    <div className="relative">
+                      <select
+                        value={visitingWorkspace.id}
+                        onChange={async (e) => {
+                          const targetId = Number(e.target.value);
+                          if (targetId && targetId !== visitingWorkspace.id) {
+                            await switchSite(targetId);
+                            triggerNotification("success", `Switched to ${sitesSummary.find(s => s.id === targetId)?.name || 'workspace'}`);
+                          }
+                        }}
+                        className="bg-white/95 hover:bg-white text-slate-900 font-bold text-xs py-2.5 px-3 rounded-xl border border-slate-900/20 shadow-sm focus:outline-none cursor-pointer"
+                        title="Quick Switch Site"
+                      >
+                        {sitesSummary.map((s) => (
+                          <option key={s.id} value={s.id}>
+                            {s.name} (#{s.id})
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  )}
+
+                  <button
+                    type="button"
+                    onClick={() => setActiveTab("select_site")}
+                    className="bg-white/95 hover:bg-white text-slate-900 font-bold text-xs py-2.5 px-3.5 rounded-xl border border-slate-900/20 shadow-sm transition flex items-center gap-1.5 cursor-pointer"
+                  >
+                    <Eye size={15} /> Select Site to Visit
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      await leaveSite();
+                      triggerNotification("info", "Returned to Global Super Admin view");
+                    }}
+                    className="bg-slate-950 hover:bg-slate-900 text-white font-black text-xs py-2.5 px-4 rounded-xl shadow-md transition flex items-center gap-1.5 cursor-pointer ml-auto lg:ml-0"
+                  >
+                    <RotateCcw size={15} className="text-amber-400" />
+                    Return to Super Admin
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
           {/* Module 1: Dashboard */}
           {activeTab === "dashboard" && (
             dashboardData?.summary ? (
@@ -6649,6 +6816,32 @@ MYSQL_DATABASE=your_db_name`}
                 <h3 className="text-xl font-black text-rose-950">Restricted Super Admin Area</h3>
                 <p className="text-xs text-rose-700 leading-relaxed">
                   Only authorized Super Administrators have global system management access. Workspace data isolation prevents access by ordinary workspace administrators and standard staff accounts.
+                </p>
+                <div className="pt-2">
+                  <button
+                    onClick={() => setActiveTab("dashboard")}
+                    className="px-5 py-2.5 bg-rose-600 hover:bg-rose-700 text-white rounded-xl text-xs font-bold transition shadow-sm cursor-pointer"
+                  >
+                    Return to Dashboard
+                  </button>
+                </div>
+              </div>
+            )
+          )}
+
+          {/* Module 15: Select Site to Visit (Super Admin Dedicated Portal) */}
+          {activeTab === "select_site" && (
+            user?.role === "SuperAdmin" ? (
+              <SelectSiteToVisit
+                onSiteSelected={() => setActiveTab("dashboard")}
+                onNavigateToTab={(tab) => setActiveTab(tab)}
+              />
+            ) : (
+              <div className="bg-rose-50 border border-rose-200 rounded-3xl p-8 text-center space-y-3 max-w-xl mx-auto my-12 shadow-sm">
+                <ShieldAlert size={36} className="text-rose-600 mx-auto" />
+                <h3 className="text-xl font-black text-rose-950">Restricted Super Admin Area</h3>
+                <p className="text-xs text-rose-700 leading-relaxed">
+                  Only authorized Super Administrators have access to the global site selection portal. Workspace data isolation prevents access by ordinary workspace administrators and standard staff accounts.
                 </p>
                 <div className="pt-2">
                   <button

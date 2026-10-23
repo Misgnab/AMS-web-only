@@ -32,7 +32,9 @@ import {
   WorkspaceItem,
   WorkspaceAdminUser,
   SuperAdminAuditLog,
-  SuperAdminOverviewStats
+  SuperAdminOverviewStats,
+  SiteSummaryItem,
+  SecurityTestSuiteSummary
 } from "./types.js";
 
 interface AppState {
@@ -208,6 +210,19 @@ interface AppState {
   toggleAdminStatus: (id: number, status: "ACTIVE" | "SUSPENDED") => Promise<{ success: boolean; error?: string }>;
   fetchSuperAdminAuditLogs: (filters?: { workspace_id?: number | string; action?: string; outcome?: string; search?: string; limit?: number }) => Promise<void>;
   fetchSuperAdminSecurityEvents: () => Promise<void>;
+
+  // Super Admin Site Visit & Context Actions
+  visitingWorkspace: WorkspaceItem | null;
+  visitingWorkspaceId: number | null;
+  sitesSummary: SiteSummaryItem[];
+  sitesLoading: boolean;
+  sitesError: string | null;
+
+  fetchSitesSummary: () => Promise<void>;
+  visitSite: (siteId: number) => Promise<{ success: boolean; workspace?: WorkspaceItem; error?: string }>;
+  leaveSite: () => Promise<{ success: boolean; error?: string }>;
+  switchSite: (siteId: number) => Promise<{ success: boolean; error?: string }>;
+  runSecurityTests: () => Promise<SecurityTestSuiteSummary | null>;
 }
 
 // Universal safe JSON parser for fetch responses
@@ -260,6 +275,27 @@ const getStoredUser = (): User | null => {
   }
 };
 
+const getStoredVisitingWorkspaceId = (): number | null => {
+  try {
+    const val = sessionStorage.getItem("attendance_visiting_ws_id");
+    if (!val || val === "null" || val === "undefined") return null;
+    const num = parseInt(val, 10);
+    return isNaN(num) ? null : num;
+  } catch {
+    return null;
+  }
+};
+
+const getStoredVisitingWorkspace = (): WorkspaceItem | null => {
+  try {
+    const val = sessionStorage.getItem("attendance_visiting_workspace");
+    if (!val || val === "null" || val === "undefined") return null;
+    return JSON.parse(val);
+  } catch {
+    return null;
+  }
+};
+
 // Helper for authenticated API calls with automatic 401 session expiration handling
 const authenticatedFetch = async (
   url: string,
@@ -271,6 +307,10 @@ const authenticatedFetch = async (
   if (token && !headers.has("Authorization")) {
     headers.set("Authorization", `Bearer ${token}`);
   }
+  const visitingWsId = getStoredVisitingWorkspaceId();
+  if (visitingWsId && !headers.has("x-workspace-id")) {
+    headers.set("x-workspace-id", String(visitingWsId));
+  }
 
   try {
     const res = await fetch(url, { ...options, headers });
@@ -279,6 +319,8 @@ const authenticatedFetch = async (
       try {
         localStorage.removeItem("attendance_token");
         localStorage.removeItem("attendance_user");
+        sessionStorage.removeItem("attendance_visiting_ws_id");
+        sessionStorage.removeItem("attendance_visiting_workspace");
       } catch {}
       if (onUnauthorized) {
         onUnauthorized();
@@ -330,7 +372,12 @@ export const useAppStore = create<AppState>((set, get) => ({
   loading: false,
   error: null,
 
-  // Super Admin state
+  // Super Admin state & Site Visit
+  visitingWorkspace: getStoredVisitingWorkspace(),
+  visitingWorkspaceId: getStoredVisitingWorkspaceId(),
+  sitesSummary: [],
+  sitesLoading: false,
+  sitesError: null,
   superAdminOverview: null,
   superAdminWorkspaces: [],
   superAdminAdmins: [],
@@ -498,12 +545,20 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   logout: () => {
+    try {
+      sessionStorage.removeItem("attendance_visiting_ws_id");
+      sessionStorage.removeItem("attendance_visiting_workspace");
+    } catch {}
     get().setToken(null);
     get().setUser(null);
     set({
+      visitingWorkspace: null,
+      visitingWorkspaceId: null,
       employees: [],
       todayAttendance: [],
       attendanceHistory: [],
+      missingCheckouts: [],
+      attendanceCorrections: [],
       permissions: [],
       attendanceRequests: [],
       salaries: [],
@@ -2236,5 +2291,219 @@ export const useAppStore = create<AppState>((set, get) => ({
     } catch (err) {
       console.error("fetchSuperAdminSecurityEvents error:", err);
     }
+  },
+
+  fetchSitesSummary: async () => {
+    try {
+      const { token } = get();
+      if (!token) return;
+      set({ sitesLoading: true, sitesError: null });
+      const res = await fetch("/api/super-admin/sites", {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (res.ok) {
+        const data = await safeJson(res);
+        set({ sitesSummary: Array.isArray(data) ? data : [], sitesLoading: false });
+      } else {
+        const errData = await safeJson(res);
+        set({ sitesLoading: false, sitesError: errData.error || "Failed to load sites directory" });
+      }
+    } catch (err: any) {
+      console.error("fetchSitesSummary error:", err);
+      set({ sitesLoading: false, sitesError: err.message || "Network error loading sites" });
+    }
+  },
+
+  visitSite: async (siteId: number) => {
+    try {
+      const { 
+        token, 
+        fetchDashboard, 
+        fetchEmployees, 
+        fetchSiteSettings, 
+        fetchTodayAttendance, 
+        fetchAttendanceHistory, 
+        fetchPermissions, 
+        fetchAttendanceRequests, 
+        fetchSalaries, 
+        fetchMissingCheckouts, 
+        fetchAttendanceCorrections, 
+        fetchWorkCalendar, 
+        fetchHolidays, 
+        fetchOvertimeRecords, 
+        fetchPenalties 
+      } = get();
+      if (!token) return { success: false, error: "Authentication required" };
+
+      set({ loading: true });
+      const res = await fetch(`/api/super-admin/sites/${siteId}/visit`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`
+        }
+      });
+
+      const data = await safeJson(res);
+      if (!res.ok || !data.success) {
+        set({ loading: false });
+        return { success: false, error: data.error || "Failed to establish site visit" };
+      }
+
+      const ws: WorkspaceItem = data.workspace;
+
+      // Store in session storage
+      try {
+        sessionStorage.setItem("attendance_visiting_ws_id", String(siteId));
+        sessionStorage.setItem("attendance_visiting_workspace", JSON.stringify(ws));
+      } catch (_) {}
+
+      // Clear all stale workspace-scoped state to prevent cross-site data leak
+      set({
+        visitingWorkspace: ws,
+        visitingWorkspaceId: siteId,
+        employees: [],
+        attendanceHistory: [],
+        todayAttendance: [],
+        permissions: [],
+        attendanceRequests: [],
+        missingCheckouts: [],
+        attendanceCorrections: [],
+        dashboardData: null,
+        siteSettings: data.siteSettings || null,
+        salaries: [],
+        overtimeRecords: [],
+        latePenalties: [],
+        workSchedules: [],
+        holidays: []
+      });
+
+      // Fetch all live data for the visited site in parallel
+      await Promise.allSettled([
+        fetchDashboard(),
+        fetchEmployees(),
+        fetchSiteSettings(),
+        fetchTodayAttendance(),
+        fetchAttendanceHistory(),
+        fetchPermissions(),
+        fetchAttendanceRequests(),
+        fetchSalaries(),
+        fetchMissingCheckouts(),
+        fetchAttendanceCorrections(),
+        fetchWorkCalendar(),
+        fetchHolidays(),
+        fetchOvertimeRecords(),
+        fetchPenalties()
+      ]);
+
+      set({ loading: false });
+      return { success: true, workspace: ws };
+    } catch (err: any) {
+      console.error("visitSite error:", err);
+      set({ loading: false });
+      return { success: false, error: err.message || "Failed to enter site workspace" };
+    }
+  },
+
+  leaveSite: async () => {
+    try {
+      const { token, visitingWorkspaceId } = get();
+      if (token && visitingWorkspaceId) {
+        await fetch(`/api/super-admin/sites/${visitingWorkspaceId}/leave`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`
+          }
+        }).catch(() => {});
+      }
+
+      try {
+        sessionStorage.removeItem("attendance_visiting_ws_id");
+        sessionStorage.removeItem("attendance_visiting_workspace");
+      } catch (_) {}
+
+      set({
+        visitingWorkspace: null,
+        visitingWorkspaceId: null,
+        employees: [],
+        attendanceHistory: [],
+        todayAttendance: [],
+        permissions: [],
+        attendanceRequests: [],
+        missingCheckouts: [],
+        attendanceCorrections: [],
+        dashboardData: null,
+        siteSettings: null,
+        salaries: [],
+        overtimeRecords: [],
+        latePenalties: [],
+        workSchedules: [],
+        holidays: []
+      });
+
+      // Refresh global telemetry and data
+      const { 
+        fetchSuperAdminOverview, 
+        fetchSuperAdminWorkspaces, 
+        fetchSitesSummary,
+        fetchDashboard,
+        fetchEmployees,
+        fetchTodayAttendance,
+        fetchAttendanceHistory,
+        fetchSiteSettings,
+        fetchPermissions,
+        fetchAttendanceRequests,
+        fetchSalaries,
+        fetchMissingCheckouts
+      } = get();
+      await Promise.allSettled([
+        fetchSuperAdminOverview(),
+        fetchSuperAdminWorkspaces(),
+        fetchSitesSummary(),
+        fetchDashboard(),
+        fetchEmployees(),
+        fetchTodayAttendance(),
+        fetchAttendanceHistory(),
+        fetchSiteSettings(),
+        fetchPermissions(),
+        fetchAttendanceRequests(),
+        fetchSalaries(),
+        fetchMissingCheckouts()
+      ]);
+
+      return { success: true };
+    } catch (err: any) {
+      console.error("leaveSite error:", err);
+      return { success: false, error: err.message };
+    }
+  },
+
+  switchSite: async (siteId: number) => {
+    const { visitSite } = get();
+    return await visitSite(siteId);
+  },
+
+  runSecurityTests: async () => {
+    try {
+      const { token } = get();
+      if (!token) return null;
+      const res = await fetch("/api/super-admin/security-tests", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`
+        }
+      });
+      if (res.ok) {
+        const data = await safeJson(res);
+        return data as SecurityTestSuiteSummary;
+      }
+      return null;
+    } catch (err) {
+      console.error("runSecurityTests error:", err);
+      return null;
+    }
   }
 }));
+

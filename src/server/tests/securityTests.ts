@@ -382,6 +382,109 @@ export async function runAutomatedSecurityTests(serverPort: number = 3000): Prom
       durationMs: Date.now() - t12Start
     });
 
+    // -------------------------------------------------------------------------------------------------
+    // TEST 13: Super Admin Site Selection Directory (/api/super-admin/sites) & RBAC Access Control
+    // -------------------------------------------------------------------------------------------------
+    const t13Start = Date.now();
+    const r13Super = await makeReq(`/api/super-admin/sites`, superAdminToken);
+    const r13Admin = await makeReq(`/api/super-admin/sites`, adminAToken);
+    const sitesList = Array.isArray(r13Super.data?.sites) ? r13Super.data.sites : [];
+    const hasWsA = sitesList.some((s: any) => s.id === testWsAId);
+    const hasWsB = sitesList.some((s: any) => s.id === testWsBId);
+    const t13Passed = r13Super.status === 200 && hasWsA && hasWsB && r13Admin.status === 403;
+    results.push({
+      id: "SEC-13",
+      name: "Super Admin Site Selection Directory API & Access Control",
+      category: "Site Visit & Context Switching",
+      description: "Super Admin can retrieve enriched metrics for all construction sites, while ordinary workspace admins are forbidden (403).",
+      passed: t13Passed,
+      details: t13Passed
+        ? `PASSED: Super Admin retrieved ${sitesList.length} sites with enriched metrics; Workspace Admin request rejected with 403 Forbidden.`
+        : `FAILED: Super status: ${r13Super.status}, Admin status: ${r13Admin.status}, hasAlpha: ${hasWsA}, hasBeta: ${hasWsB}`,
+      durationMs: Date.now() - t13Start
+    });
+
+    // -------------------------------------------------------------------------------------------------
+    // TEST 14: Super Admin Visit Site Context Establishment & Audit Logging
+    // -------------------------------------------------------------------------------------------------
+    const t14Start = Date.now();
+    const r14Visit = await makeReq(`/api/super-admin/sites/${testWsBId}/visit`, superAdminToken, {
+      method: "POST"
+    });
+    const visitAudit = db.prepare(`
+      SELECT * FROM audit_logs 
+      WHERE action = 'SUPERADMIN_VISIT_SITE' AND user_id = ?
+      ORDER BY id DESC LIMIT 1
+    `).get(superAdminId) as any;
+    const t14Passed = r14Visit.status === 200 && r14Visit.data?.workspace?.id === testWsBId && !!visitAudit;
+    results.push({
+      id: "SEC-14",
+      name: "Super Admin Visit Site Context & Audit Logging",
+      category: "Site Visit & Context Switching",
+      description: "Super Admin can securely establish active context for a target workspace and an immutable audit log is generated.",
+      passed: t14Passed,
+      details: t14Passed
+        ? `PASSED: Established active context for '${r14Visit.data?.workspace?.name}' (#${testWsBId}); Audit log ID #${visitAudit?.id} recorded.`
+        : `FAILED: Visit status: ${r14Visit.status}, audit logged: ${!!visitAudit}`,
+      durationMs: Date.now() - t14Start
+    });
+
+    // -------------------------------------------------------------------------------------------------
+    // TEST 15: Scoped Data Isolation during Site Visit
+    // -------------------------------------------------------------------------------------------------
+    const t15Start = Date.now();
+    const r15ScopedEmployees = await makeReq(`/api/employees`, superAdminToken, {
+      headers: { "x-workspace-id": String(testWsBId) }
+    });
+    const empList = Array.isArray(r15ScopedEmployees.data) ? r15ScopedEmployees.data : [];
+    const hasOnlyWsB = empList.length > 0 && empList.every((e: any) => e.workspace_id === testWsBId || e.id === empBId);
+    const doesNotHaveWsA = !empList.some((e: any) => e.id === empAId);
+
+    // Leave site
+    const r15Leave = await makeReq(`/api/super-admin/sites/${testWsBId}/leave`, superAdminToken, {
+      method: "POST"
+    });
+    const leaveAudit = db.prepare(`
+      SELECT * FROM audit_logs 
+      WHERE action = 'SUPERADMIN_LEAVE_SITE' AND user_id = ?
+      ORDER BY id DESC LIMIT 1
+    `).get(superAdminId) as any;
+    const t15Passed = r15ScopedEmployees.status === 200 && hasOnlyWsB && doesNotHaveWsA && r15Leave.status === 200 && !!leaveAudit;
+    results.push({
+      id: "SEC-15",
+      name: "Active Context Data Scoping & Leave Audit Trail",
+      category: "Site Visit & Context Switching",
+      description: "While visiting Site B, Super Admin data queries are scoped exclusively to Site B records. Leaving the site restores global context and logs an audit event.",
+      passed: t15Passed,
+      details: t15Passed
+        ? `PASSED: Scoped employee list contains exclusively Site B members; Exit recorded with audit log ID #${leaveAudit?.id}.`
+        : `FAILED: Scoped status: ${r15ScopedEmployees.status}, hasOnlyWsB: ${hasOnlyWsB}, doesNotHaveWsA: ${doesNotHaveWsA}, leaveStatus: ${r15Leave.status}`,
+      durationMs: Date.now() - t15Start
+    });
+
+    // -------------------------------------------------------------------------------------------------
+    // TEST 16: Workspace Admin Header Forgery Prevention
+    // -------------------------------------------------------------------------------------------------
+    const t16Start = Date.now();
+    const r16Forge = await makeReq(`/api/employees`, adminAToken, {
+      headers: { "x-workspace-id": String(testWsBId) }
+    });
+    const forgedList = Array.isArray(r16Forge.data) ? r16Forge.data : [];
+    const leakedTargetEmp = forgedList.some((e: any) => e.id === empBId);
+    const retainedOwnEmp = forgedList.some((e: any) => e.id === empAId);
+    const t16Passed = r16Forge.status === 200 && !leakedTargetEmp && retainedOwnEmp;
+    results.push({
+      id: "SEC-16",
+      name: "Workspace Admin Header Forgery Prevention",
+      category: "Site Visit & Context Switching",
+      description: "Non-SuperAdmin cannot spoof x-workspace-id header to breach isolation; backend strictly confines them to their own assigned workspace.",
+      passed: t16Passed,
+      details: t16Passed
+        ? `PASSED: Forged x-workspace-id header was safely ignored; Admin A received only Workspace A staff (leaked: false).`
+        : `FAILED: Admin A accessed unauthorized records or query failed with status ${r16Forge.status}`,
+      durationMs: Date.now() - t16Start
+    });
+
   } finally {
     // Clean up test data
     try {

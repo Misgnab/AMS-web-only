@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useMemo } from "react";
 import { useAppStore } from "../store.js";
-import { WorkspaceItem, WorkspaceAdminUser, SuperAdminAuditLog } from "../types.js";
+import { WorkspaceItem, WorkspaceAdminUser, SuperAdminAuditLog, SecurityTestSuiteSummary } from "../types.js";
 import {
   Shield,
   ShieldAlert,
@@ -49,7 +49,8 @@ export const SuperAdminManagementTab: React.FC = () => {
     updateWorkspaceAdmin,
     toggleAdminStatus,
     fetchSuperAdminAuditLogs,
-    fetchSuperAdminSecurityEvents
+    fetchSuperAdminSecurityEvents,
+    visitSite
   } = useAppStore();
 
   const [activeSubTab, setActiveSubTab] = useState<"workspaces" | "admins" | "audit" | "security">("workspaces");
@@ -584,6 +585,21 @@ export const SuperAdminManagementTab: React.FC = () => {
                     Created {new Date(ws.created_at).toLocaleDateString()}
                   </span>
                   <div className="flex items-center gap-1.5">
+                    <button
+                      onClick={async () => {
+                        const ok = await visitSite(ws.id);
+                        if (ok) {
+                          triggerSuccess(`Switched context to '${ws.name}'. Active site context established.`);
+                        } else {
+                          triggerError(`Could not switch to workspace '${ws.name}'.`);
+                        }
+                      }}
+                      className="px-3 py-1.5 bg-amber-500 hover:bg-amber-600 text-slate-950 rounded-lg text-xs font-black transition flex items-center gap-1 cursor-pointer shadow-xs"
+                      title="Visit Site Dashboard"
+                    >
+                      <Eye size={12} />
+                      <span>Visit Site</span>
+                    </button>
                     <button
                       onClick={() => openEditWorkspace(ws)}
                       className="px-3 py-1.5 bg-gray-100 hover:bg-gray-200 text-slate-700 rounded-lg text-xs font-bold transition flex items-center gap-1 cursor-pointer"

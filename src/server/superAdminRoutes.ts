@@ -3,6 +3,7 @@ import bcrypt from "bcryptjs";
 import { db } from "./database.js";
 import { recordAuditLog, getClientIp } from "./rbac.js";
 import { getEthiopianDateString } from "../utils/ethiopianTime.js";
+import { runAutomatedSecurityTests } from "./tests/securityTests.js";
 
 export const superAdminRouter = Router();
 
@@ -648,3 +649,177 @@ superAdminRouter.get("/security-events", (req: Request & { user?: any }, res: Re
     res.status(500).json({ error: "Failed to retrieve security events", details: error.message });
   }
 });
+
+// =========================================================================
+// 5. SITE SELECTION & VISIT MANAGEMENT
+// =========================================================================
+superAdminRouter.get("/sites", (req: Request & { user?: any }, res: Response) => {
+  try {
+    const todayStr = getEthiopianDateString(new Date());
+
+    // Fetch all workspaces and join real-time site details and metrics
+    const workspaces = db.prepare(`
+      SELECT 
+        w.id,
+        w.name,
+        w.code,
+        COALESCE(w.status, 'ACTIVE') as status,
+        w.description,
+        w.created_by,
+        w.created_at,
+        ss.office_name,
+        ss.latitude,
+        ss.longitude,
+        ss.wifi_ssid,
+        ss.allowed_radius,
+        (
+          SELECT u.full_name FROM users u 
+          WHERE u.workspace_id = w.id AND u.role IN ('AdminCreator', 'AdminManager', 'SuperAdmin')
+          ORDER BY CASE u.role WHEN 'AdminCreator' THEN 1 WHEN 'AdminManager' THEN 2 ELSE 3 END ASC, u.id ASC 
+          LIMIT 1
+        ) as admin_name,
+        (
+          SELECT u.phone_number FROM users u 
+          WHERE u.workspace_id = w.id AND u.role IN ('AdminCreator', 'AdminManager', 'SuperAdmin')
+          ORDER BY CASE u.role WHEN 'AdminCreator' THEN 1 WHEN 'AdminManager' THEN 2 ELSE 3 END ASC, u.id ASC 
+          LIMIT 1
+        ) as admin_phone,
+        (
+          SELECT u.role FROM users u 
+          WHERE u.workspace_id = w.id AND u.role IN ('AdminCreator', 'AdminManager', 'SuperAdmin')
+          ORDER BY CASE u.role WHEN 'AdminCreator' THEN 1 WHEN 'AdminManager' THEN 2 ELSE 3 END ASC, u.id ASC 
+          LIMIT 1
+        ) as admin_role,
+        (
+          SELECT COUNT(*) FROM users u 
+          WHERE u.workspace_id = w.id AND u.role NOT IN ('SuperAdmin', 'Bootstrap')
+        ) as employee_count,
+        (
+          SELECT COUNT(DISTINCT a.user_id) FROM attendance a 
+          WHERE (a.workspace_id = w.id OR a.user_id IN (SELECT id FROM users WHERE workspace_id = w.id)) 
+            AND a.date = ?
+        ) as today_attendance_count,
+        (
+          (SELECT COUNT(*) FROM permissions p 
+           WHERE (p.workspace_id = w.id OR p.user_id IN (SELECT id FROM users WHERE workspace_id = w.id)) 
+             AND p.status = 'Pending')
+          +
+          (SELECT COUNT(*) FROM attendance_requests ar 
+           WHERE (ar.workspace_id = w.id OR ar.user_id IN (SELECT id FROM users WHERE workspace_id = w.id)) 
+             AND ar.status = 'Pending')
+          +
+          (SELECT COUNT(*) FROM attendance_corrections ac 
+           WHERE (ac.workspace_id = w.id OR ac.employee_id IN (SELECT id FROM users WHERE workspace_id = w.id)) 
+             AND ac.status = 'PENDING')
+        ) as pending_requests_count,
+        COALESCE(
+          (SELECT al.created_at FROM audit_logs al WHERE al.workspace_id = w.id ORDER BY al.id DESC LIMIT 1),
+          (SELECT a.created_at FROM attendance a WHERE a.workspace_id = w.id ORDER BY a.id DESC LIMIT 1),
+          w.created_at
+        ) as last_activity
+      FROM workspaces w
+      LEFT JOIN site_settings ss ON ss.workspace_id = w.id
+      ORDER BY w.id ASC
+    `).all(todayStr);
+
+    const enriched = workspaces.map((site: any) => {
+      let todayAttendanceStatus = "No check-ins today";
+      if (site.today_attendance_count > 0) {
+        todayAttendanceStatus = `Active (${site.today_attendance_count} present today)`;
+      }
+
+      return {
+        ...site,
+        admin_name: site.admin_name || "Unassigned Admin",
+        admin_phone: site.admin_phone || "N/A",
+        admin_role: site.admin_role || "Administrator",
+        office_name: site.office_name || site.name,
+        today_attendance_status: todayAttendanceStatus
+      };
+    });
+
+    res.json(enriched);
+  } catch (error: any) {
+    console.error("Super Admin sites summary error:", error);
+    res.status(500).json({ error: "Failed to retrieve sites summary", details: error.message });
+  }
+});
+
+superAdminRouter.post("/sites/:id/visit", (req: Request & { user?: any }, res: Response) => {
+  const siteId = parseInt(req.params.id, 10);
+  if (isNaN(siteId) || siteId <= 0) {
+    return res.status(400).json({ error: "Valid site ID is required" });
+  }
+
+  try {
+    const site: any = db.prepare("SELECT * FROM workspaces WHERE id = ?").get(siteId);
+    if (!site) {
+      return res.status(404).json({ error: `Site with ID #${siteId} was not found` });
+    }
+
+    const siteSettings = db.prepare("SELECT * FROM site_settings WHERE workspace_id = ?").get(siteId);
+
+    recordAuditLog({
+      workspaceId: siteId,
+      userId: req.user?.id,
+      actorRole: "SuperAdmin",
+      action: "SUPERADMIN_VISIT_SITE",
+      details: `Super Admin ${req.user?.full_name} established administrative visiting session for workspace #${siteId} ('${site.name}')`,
+      targetType: "WORKSPACE",
+      targetId: siteId,
+      ipAddress: getClientIp(req),
+      outcome: "SUCCESS"
+    });
+
+    res.json({
+      success: true,
+      workspace: site,
+      siteSettings: siteSettings || null,
+      message: `Now visiting site: ${site.name}`
+    });
+  } catch (error: any) {
+    console.error("Super Admin visit site error:", error);
+    res.status(500).json({ error: "Failed to establish site visit", details: error.message });
+  }
+});
+
+superAdminRouter.post(["/sites/leave", "/sites/:id/leave"], (req: Request & { user?: any }, res: Response) => {
+  const siteIdParam = req.params.id ? parseInt(req.params.id, 10) : undefined;
+  const siteId = (!isNaN(siteIdParam || NaN) && (siteIdParam || 0) > 0) ? siteIdParam : (req.body.workspace_id || null);
+
+  try {
+    recordAuditLog({
+      workspaceId: siteId,
+      userId: req.user?.id,
+      actorRole: "SuperAdmin",
+      action: "SUPERADMIN_LEAVE_SITE",
+      details: `Super Admin ${req.user?.full_name} exited site visiting session${siteId ? ` for workspace #${siteId}` : ""} and returned to Super Admin governance`,
+      targetType: "WORKSPACE",
+      targetId: siteId,
+      ipAddress: getClientIp(req),
+      outcome: "SUCCESS"
+    });
+
+    res.json({
+      success: true,
+      message: "Exited site visiting mode successfully"
+    });
+  } catch (error: any) {
+    console.error("Super Admin leave site error:", error);
+    res.status(500).json({ error: "Failed to record site exit", details: error.message });
+  }
+});
+
+// Run automated security and isolation test suite
+superAdminRouter.post("/security-tests", async (req: Request & { user?: any }, res: Response) => {
+  try {
+    const port = Number(process.env.PORT) || 3000;
+    const summary = await runAutomatedSecurityTests(port);
+    res.json(summary);
+  } catch (error: any) {
+    console.error("Run security tests error:", error);
+    res.status(500).json({ error: "Failed to run automated security tests", details: error.message });
+  }
+});
+
+

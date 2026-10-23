@@ -928,3 +928,46 @@ export interface SuperAdminOverviewStats {
   securityEventsCount: number;
 }
 
+export interface SiteSummaryItem {
+  id: number;
+  name: string;
+  code?: string | null;
+  status: "ACTIVE" | "INACTIVE" | "SUSPENDED";
+  description?: string | null;
+  created_by?: number | null;
+  created_at: string;
+  office_name?: string | null;
+  latitude?: number | null;
+  longitude?: number | null;
+  wifi_ssid?: string | null;
+  allowed_radius?: number | null;
+  admin_name: string;
+  admin_phone: string;
+  admin_role: string;
+  employee_count: number;
+  today_attendance_count: number;
+  today_attendance_status: string;
+  pending_requests_count: number;
+  last_activity: string;
+}
+
+export interface SecurityTestResult {
+  id: string;
+  name: string;
+  category: string;
+  description: string;
+  passed: boolean;
+  details: string;
+  durationMs: number;
+}
+
+export interface SecurityTestSuiteSummary {
+  total: number;
+  passed: number;
+  failed: number;
+  allPassed: boolean;
+  executedAt: string;
+  results: SecurityTestResult[];
+}
+
+

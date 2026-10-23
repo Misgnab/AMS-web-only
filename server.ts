@@ -254,6 +254,7 @@ interface AuthenticatedRequest extends Request {
     role: string;
     full_name: string;
     workspace_id?: number | null;
+    is_visiting?: boolean;
   };
 }
 
@@ -264,15 +265,24 @@ interface AuthenticatedRequest extends Request {
  * 2. If an admin has created a workspace, show that admin's attendance inside the workspace they created.
  * 3. If an admin has NOT created a workspace, show that admin's attendance on the dashboard of their creator/parent admin.
  * 4. Regular employees appear in their workspace (or if created by the viewer admin).
+ * 5. If SuperAdmin is visiting a specific workspace, scope strictly to that workspace.
  */
 function getWorkspaceUsersFilter(
   alias: string = "u",
   currentRole?: string,
   workspaceId?: number | null,
-  viewerAdminId?: number | null
+  viewerAdminId?: number | null,
+  isVisitingWorkspace?: boolean
 ): { clause: string; params: any[] } {
-  if (currentRole === "SuperAdmin") {
+  if (currentRole === "SuperAdmin" && !isVisitingWorkspace) {
     return { clause: "1=1", params: [] };
+  }
+  if (currentRole === "SuperAdmin" && isVisitingWorkspace) {
+    const wsId = workspaceId || 1;
+    return {
+      clause: `(${alias}.workspace_id = ? OR EXISTS (SELECT 1 FROM workspaces ws WHERE ws.id = ? AND ws.created_by = ${alias}.id))`,
+      params: [wsId, wsId]
+    };
   }
   if (currentRole === "Bootstrap") {
     return { clause: `${alias}.workspace_id = -1`, params: [] };
@@ -358,19 +368,24 @@ function authenticateToken(req: AuthenticatedRequest, res: Response, next: NextF
         }
 
         let effectiveWorkspaceId = dbUser.workspace_id || user.workspace_id || 1;
+        let isVisiting = false;
         // For SuperAdmin, check if a target workspace override was supplied via x-workspace-id header
         if (dbUser.role === "SuperAdmin") {
           const wsHeader = req.headers["x-workspace-id"];
           if (wsHeader && typeof wsHeader === "string") {
             const parsedWs = parseInt(wsHeader, 10);
             if (!isNaN(parsedWs) && parsedWs > 0) {
-              effectiveWorkspaceId = parsedWs;
+              const wsCheck = db.prepare("SELECT id FROM workspaces WHERE id = ?").get(parsedWs);
+              if (wsCheck) {
+                effectiveWorkspaceId = parsedWs;
+                isVisiting = true;
+              }
             }
           }
         }
 
-        req.user = { ...user, ...dbUser, workspace_id: effectiveWorkspaceId };
-        console.log(`Auth successful: User ${req.user.full_name} (${req.user.role}) - Workspace: ${effectiveWorkspaceId}`);
+        req.user = { ...user, ...dbUser, workspace_id: effectiveWorkspaceId, is_visiting: isVisiting };
+        console.log(`Auth successful: User ${req.user.full_name} (${req.user.role}) - Workspace: ${effectiveWorkspaceId} (Visiting: ${isVisiting})`);
         next();
       } catch (dbErr: any) {
         console.error("Auth middleware DB error:", dbErr?.message || dbErr);
@@ -1150,7 +1165,7 @@ app.get("/api/employees", authenticateToken, (req: AuthenticatedRequest, res: Re
 
   try {
     let rawEmployees: any[];
-    if (currentRole === "SuperAdmin") {
+    if (currentRole === "SuperAdmin" && !req.user?.is_visiting) {
       rawEmployees = db.prepare(`
         SELECT u.id, u.full_name, u.phone_number, u.role, u.photo, u.hourly_rate, u.monthly_base_salary,
                u.salary_calculation_mode, u.department, u.registration_date, w.name as workspace_name, u.workspace_id,
@@ -1170,7 +1185,7 @@ app.get("/api/employees", authenticateToken, (req: AuthenticatedRequest, res: Re
         ORDER BY u.role DESC, u.full_name ASC
       `).all();
     } else {
-      const { clause, params } = getWorkspaceUsersFilter("u", currentRole, currentWorkspaceId, req.user?.id);
+      const { clause, params } = getWorkspaceUsersFilter("u", currentRole, currentWorkspaceId, req.user?.id, req.user?.is_visiting);
       rawEmployees = db.prepare(`
         SELECT u.id, u.full_name, u.phone_number, u.role, u.photo, u.hourly_rate, u.monthly_base_salary,
                u.salary_calculation_mode, u.department, u.registration_date, w.name as workspace_name, u.workspace_id,
@@ -5293,7 +5308,7 @@ app.get("/api/attendance/missing-checkouts", authenticateToken, (req: Authentica
     AttendanceService.evaluateAttendanceExceptionsAndShifts(currentWorkspaceId || 1, todayStr, nowTimeStr);
 
     let records: any[];
-    if (currentRole === "SuperAdmin") {
+    if (currentRole === "SuperAdmin" && !req.user?.is_visiting) {
       records = db.prepare(`
         SELECT a.*, u.full_name, u.phone_number, u.role, u.hourly_rate, u.monthly_base_salary,
                w.name as workspace_name, adm.full_name as admin_corrector_name
@@ -5312,8 +5327,8 @@ app.get("/api/attendance/missing-checkouts", authenticateToken, (req: Authentica
       `).all(todayStr, todayStr, nowTotalMins, morningCutoffMins, todayStr, nowTotalMins, afternoonCutoffMins);
     } else if (currentRole === "Bootstrap") {
       records = [];
-    } else if (currentRole === "AdminCreator" || currentRole === "AdminManager" || currentRole === "HR") {
-      const { clause, params: filterParams } = getWorkspaceUsersFilter("u", currentRole, currentWorkspaceId, req.user?.id);
+    } else if (currentRole === "AdminCreator" || currentRole === "AdminManager" || currentRole === "HR" || (currentRole === "SuperAdmin" && req.user?.is_visiting)) {
+      const { clause, params: filterParams } = getWorkspaceUsersFilter("u", currentRole, currentWorkspaceId, req.user?.id, req.user?.is_visiting);
       records = db.prepare(`
         SELECT a.*, u.full_name, u.phone_number, u.role, u.hourly_rate, u.monthly_base_salary,
                w.name as workspace_name, adm.full_name as admin_corrector_name
@@ -5618,7 +5633,7 @@ app.get("/api/attendance/corrections", authenticateToken, (req: AuthenticatedReq
 
   try {
     let corrections: any[];
-    if (currentRole === "SuperAdmin") {
+    if (currentRole === "SuperAdmin" && !req.user?.is_visiting) {
       corrections = AttendanceService.getCorrectionRequests();
     } else if (isAdmin) {
       corrections = AttendanceService.getCorrectionRequests(currentWorkspaceId || 1);
@@ -5864,7 +5879,7 @@ app.get("/api/attendance/history", authenticateToken, (req: AuthenticatedRequest
 
   try {
     let logs: any[];
-    if (currentRole === "SuperAdmin") {
+    if (currentRole === "SuperAdmin" && !req.user?.is_visiting) {
       logs = db.prepare(`
         SELECT a.*, u.full_name, u.phone_number, u.role, COALESCE(w.name, uw.name, 'Main Workspace') as workspace_name, adm.full_name as admin_corrector_name
         FROM attendance a
@@ -5876,8 +5891,8 @@ app.get("/api/attendance/history", authenticateToken, (req: AuthenticatedRequest
       `).all();
     } else if (currentRole === "Bootstrap") {
       logs = [];
-    } else if (["AdminCreator", "AdminManager", "Admin", "HR"].includes(currentRole || "")) {
-      const { clause, params } = getWorkspaceUsersFilter("u", currentRole, currentWorkspaceId, req.user?.id);
+    } else if (["AdminCreator", "AdminManager", "Admin", "HR"].includes(currentRole || "") || (currentRole === "SuperAdmin" && req.user?.is_visiting)) {
+      const { clause, params } = getWorkspaceUsersFilter("u", currentRole, currentWorkspaceId, req.user?.id, req.user?.is_visiting);
       logs = db.prepare(`
         SELECT a.*, u.full_name, u.phone_number, u.role, COALESCE(w.name, uw.name, 'Main Workspace') as workspace_name, adm.full_name as admin_corrector_name
         FROM attendance a
@@ -5903,7 +5918,7 @@ app.get("/api/attendance/history", authenticateToken, (req: AuthenticatedRequest
 
     // Synthesize "Present" records for approved permissions
     let permissions: any[];
-    if (currentRole === "SuperAdmin") {
+    if (currentRole === "SuperAdmin" && !req.user?.is_visiting) {
       permissions = db.prepare(`
         SELECT p.*, u.full_name, u.phone_number, u.role, COALESCE(w.name, uw.name, 'Main Workspace') as workspace_name
         FROM permissions p
@@ -5912,8 +5927,8 @@ app.get("/api/attendance/history", authenticateToken, (req: AuthenticatedRequest
         LEFT JOIN workspaces uw ON u.workspace_id = uw.id
         WHERE p.status = 'Approved'
       `).all();
-    } else if (["AdminCreator", "AdminManager", "Admin", "HR"].includes(currentRole || "")) {
-      const { clause, params } = getWorkspaceUsersFilter("u", currentRole, currentWorkspaceId, req.user?.id);
+    } else if (["AdminCreator", "AdminManager", "Admin", "HR"].includes(currentRole || "") || (currentRole === "SuperAdmin" && req.user?.is_visiting)) {
+      const { clause, params } = getWorkspaceUsersFilter("u", currentRole, currentWorkspaceId, req.user?.id, req.user?.is_visiting);
       permissions = db.prepare(`
         SELECT p.*, u.full_name, u.phone_number, u.role, COALESCE(w.name, uw.name, 'Main Workspace') as workspace_name
         FROM permissions p
@@ -5984,12 +5999,12 @@ app.get("/api/attendance/dashboard", authenticateToken, (req: AuthenticatedReque
     // Total active workforce (including employees and admins)
     const trackedRoles = "('Employee', 'Purchaser', 'Accountant', 'Engineer', 'HR', 'AdminCreator', 'AdminManager', 'Admin', 'SuperAdmin')";
     let employeesCount: any;
-    if (currentRole === "SuperAdmin") {
+    if (currentRole === "SuperAdmin" && !req.user?.is_visiting) {
       employeesCount = db.prepare(`SELECT COUNT(*) as count FROM users WHERE role IN ${trackedRoles}`).get();
     } else if (currentRole === "Bootstrap") {
       employeesCount = { count: 0 };
     } else {
-      const { clause, params: filterParams } = getWorkspaceUsersFilter("u", currentRole, currentWorkspaceId, req.user?.id);
+      const { clause, params: filterParams } = getWorkspaceUsersFilter("u", currentRole, currentWorkspaceId, req.user?.id, req.user?.is_visiting);
       employeesCount = db.prepare(`
         SELECT COUNT(*) as count 
         FROM users u
@@ -6010,7 +6025,7 @@ app.get("/api/attendance/dashboard", authenticateToken, (req: AuthenticatedReque
 
     // Daily active check-ins with overtime details (including admins)
     let todayCheckIns: any[];
-    if (currentRole === "SuperAdmin") {
+    if (currentRole === "SuperAdmin" && !req.user?.is_visiting) {
       todayCheckIns = db.prepare(`
         SELECT a.user_id, a.status, a.session, a.attendance_type, a.work_status, a.work_status_reason, a.overtime_status, a.overtime_hours, a.total_hours 
         FROM attendance a
@@ -6020,7 +6035,7 @@ app.get("/api/attendance/dashboard", authenticateToken, (req: AuthenticatedReque
     } else if (currentRole === "Bootstrap") {
       todayCheckIns = [];
     } else {
-      const { clause, params: filterParams } = getWorkspaceUsersFilter("u", currentRole, currentWorkspaceId, req.user?.id);
+      const { clause, params: filterParams } = getWorkspaceUsersFilter("u", currentRole, currentWorkspaceId, req.user?.id, req.user?.is_visiting);
       todayCheckIns = db.prepare(`
         SELECT a.user_id, a.status, a.session, a.attendance_type, a.work_status, a.work_status_reason, a.overtime_status, a.overtime_hours, a.total_hours 
         FROM attendance a
@@ -6060,14 +6075,14 @@ app.get("/api/attendance/dashboard", authenticateToken, (req: AuthenticatedReque
 
     // Approved permissions count as "Present" (even if they didn't check in)
     let approvedPermissions: any[];
-    if (currentRole === "SuperAdmin") {
+    if (currentRole === "SuperAdmin" && !req.user?.is_visiting) {
       approvedPermissions = db.prepare(`
         SELECT user_id FROM permissions 
         WHERE status = 'Approved' 
         AND ? BETWEEN COALESCE(approved_from_date, start_date) AND COALESCE(approved_to_date, end_date)
       `).all(todayStr);
     } else {
-      const { clause, params: filterParams } = getWorkspaceUsersFilter("u", currentRole, currentWorkspaceId, req.user?.id);
+      const { clause, params: filterParams } = getWorkspaceUsersFilter("u", currentRole, currentWorkspaceId, req.user?.id, req.user?.is_visiting);
       approvedPermissions = db.prepare(`
         SELECT p.user_id FROM permissions p
         JOIN users u ON p.user_id = u.id
@@ -6080,13 +6095,13 @@ app.get("/api/attendance/dashboard", authenticateToken, (req: AuthenticatedReque
 
     // Approved attendance requests also count as "Present"
     let approvedAttendanceReqs: any[];
-    if (currentRole === "SuperAdmin") {
+    if (currentRole === "SuperAdmin" && !req.user?.is_visiting) {
       approvedAttendanceReqs = db.prepare(`
         SELECT user_id FROM attendance_requests 
         WHERE status = 'Approved' AND date = ?
       `).all(todayStr);
     } else {
-      const { clause, params: filterParams } = getWorkspaceUsersFilter("u", currentRole, currentWorkspaceId, req.user?.id);
+      const { clause, params: filterParams } = getWorkspaceUsersFilter("u", currentRole, currentWorkspaceId, req.user?.id, req.user?.is_visiting);
       approvedAttendanceReqs = db.prepare(`
         SELECT r.user_id FROM attendance_requests r
         JOIN users u ON r.user_id = u.id
@@ -6139,12 +6154,12 @@ app.get("/api/attendance/dashboard", authenticateToken, (req: AuthenticatedReque
     let dashboardUserClause = "1=1";
     let dashboardUserParams: any[] = [];
 
-    if (currentRole === "SuperAdmin") {
+    if (currentRole === "SuperAdmin" && !req.user?.is_visiting) {
       dashboardUserClause = "1=1";
     } else if (currentRole === "Bootstrap") {
       dashboardUserClause = "u.workspace_id = -1";
     } else {
-      const { clause, params: filterParams } = getWorkspaceUsersFilter("u", currentRole, currentWorkspaceId, req.user?.id);
+      const { clause, params: filterParams } = getWorkspaceUsersFilter("u", currentRole, currentWorkspaceId, req.user?.id, req.user?.is_visiting);
       dashboardUserClause = clause;
       dashboardUserParams = filterParams;
     }
@@ -6222,7 +6237,7 @@ app.get("/api/permissions", authenticateToken, (req: AuthenticatedRequest, res: 
 
   try {
     let requests;
-    if (currentRole === "SuperAdmin") {
+    if (currentRole === "SuperAdmin" && !req.user?.is_visiting) {
       requests = db.prepare(`
         SELECT p.*, u.full_name, u.phone_number
         FROM permissions p
@@ -6231,14 +6246,15 @@ app.get("/api/permissions", authenticateToken, (req: AuthenticatedRequest, res: 
       `).all();
     } else if (currentRole === "Bootstrap") {
       requests = [];
-    } else if (currentRole === "AdminCreator" || currentRole === "AdminManager") {
+    } else if (["AdminCreator", "AdminManager", "Admin", "HR"].includes(currentRole || "") || (currentRole === "SuperAdmin" && req.user?.is_visiting)) {
+      const { clause, params: filterParams } = getWorkspaceUsersFilter("u", currentRole, currentWorkspaceId, req.user?.id, req.user?.is_visiting);
       requests = db.prepare(`
         SELECT p.*, u.full_name, u.phone_number
         FROM permissions p
         JOIN users u ON p.user_id = u.id
-        WHERE p.workspace_id = ?
+        WHERE (p.workspace_id = ? OR ${clause})
         ORDER BY p.created_at DESC
-      `).all(currentWorkspaceId);
+      `).all(currentWorkspaceId, ...filterParams);
     } else {
       requests = db.prepare(`
         SELECT p.*, u.full_name, u.phone_number
@@ -6460,7 +6476,7 @@ app.get("/api/attendance-requests", authenticateToken, (req: AuthenticatedReques
 
   try {
     let requests;
-    if (currentRole === "SuperAdmin") {
+    if (currentRole === "SuperAdmin" && !req.user?.is_visiting) {
       requests = db.prepare(`
         SELECT ar.*, u.full_name, u.phone_number
         FROM attendance_requests ar
@@ -6469,15 +6485,15 @@ app.get("/api/attendance-requests", authenticateToken, (req: AuthenticatedReques
       `).all();
     } else if (currentRole === "Bootstrap") {
       requests = [];
-    } else if (currentRole === "AdminCreator" || currentRole === "AdminManager") {
-      const { clause, params: filterParams } = getWorkspaceUsersFilter("u", currentRole, currentWorkspaceId, req.user?.id);
+    } else if (["AdminCreator", "AdminManager", "Admin", "HR"].includes(currentRole || "") || (currentRole === "SuperAdmin" && req.user?.is_visiting)) {
+      const { clause, params: filterParams } = getWorkspaceUsersFilter("u", currentRole, currentWorkspaceId, req.user?.id, req.user?.is_visiting);
       requests = db.prepare(`
         SELECT ar.*, u.full_name, u.phone_number
         FROM attendance_requests ar
         JOIN users u ON ar.user_id = u.id
-        WHERE ${clause}
+        WHERE (ar.workspace_id = ? OR ${clause})
         ORDER BY ar.created_at DESC
-      `).all(...filterParams);
+      `).all(currentWorkspaceId, ...filterParams);
     } else {
       requests = db.prepare(`
         SELECT ar.*, u.full_name, u.phone_number
@@ -7619,7 +7635,7 @@ app.get("/api/salaries", authenticateToken, (req: AuthenticatedRequest, res: Res
     let usersQuery = "";
     const params: any[] = [];
 
-    if (currentRole === "SuperAdmin") {
+    if (currentRole === "SuperAdmin" && !req.user?.is_visiting) {
       usersQuery = `
         SELECT u.*, w.name as workspace_name 
         FROM users u 
