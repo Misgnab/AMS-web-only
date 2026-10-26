@@ -9,7 +9,7 @@ FROM node:22-alpine AS builder
 WORKDIR /app
 
 # Install package dependencies
-COPY package.json package-lock.json* ./
+COPY package.json package-lock.json ./
 RUN npm ci
 
 # Copy full application source code
@@ -39,14 +39,14 @@ RUN mkdir -p /app/data && chown -R node:node /app
 
 # Copy production artifacts from builder stage
 COPY --from=builder --chown=node:node /app/package.json ./package.json
+COPY --from=builder --chown=node:node /app/package-lock.json ./package-lock.json
 COPY --from=builder --chown=node:node /app/node_modules ./node_modules
 COPY --from=builder --chown=node:node /app/dist ./dist
-COPY --from=builder --chown=node:node /app/server.ts ./server.ts
 
 # Configure default MySQL database environment variables
 ENV MYSQL_HOST=127.0.0.1
 ENV MYSQL_PORT=3306
-ENV MYSQL_USER=root
+ENV MYSQL_USER=buildtrack_app
 ENV MYSQL_DATABASE=buildtrack_ams
 
 # Drop root privileges and run as unprivileged node user

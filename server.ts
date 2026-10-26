@@ -29,6 +29,8 @@ import bcrypt from "bcryptjs";
 import crypto from "node:crypto";
 import { createServer as createViteServer } from "vite";
 import { db, initDatabase, databaseManager } from "./src/server/database.ts";
+import { JWT_SECRET } from "./src/server/authConfig.ts";
+import type { MysqlConfig } from "./src/server/db/databaseTypes.ts";
 import { WorkCalendarService } from "./src/server/workCalendarService.ts";
 import { AttendanceService } from "./src/server/attendanceService.ts";
 import { toEthiopian, toGregorian } from "ethiopian-date";
@@ -53,29 +55,94 @@ try {
 initDatabase();
 
 const app = express();
-const PORT = 3000;
+const isProduction = process.env.NODE_ENV === "production";
+const PORT = (() => {
+  const rawPort = process.env.PORT?.trim();
+  if (!rawPort) return 3000;
+  const parsed = Number.parseInt(rawPort, 10);
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) {
+    throw new Error(`Invalid PORT value: ${rawPort}`);
+  }
+  return parsed;
+})();
+
+const allowedCorsOrigins = new Set(
+  [process.env.CORS_ORIGIN, process.env.APP_URL]
+    .flatMap((value) => (value || "").split(","))
+    .map((value) => value.trim())
+    .filter(Boolean)
+);
+
+function isOriginAllowed(origin?: string): boolean {
+  if (!origin) return true;
+  if (allowedCorsOrigins.size === 0) return !isProduction;
+  return allowedCorsOrigins.has(origin);
+}
+
+function sanitizeMysqlConfig(input: any, fallback?: Partial<MysqlConfig>): MysqlConfig {
+  const host = String(input?.host ?? fallback?.host ?? "127.0.0.1").trim();
+  const user = String(input?.user ?? fallback?.user ?? "").trim();
+  const database = String(input?.database ?? fallback?.database ?? "buildtrack_ams").trim();
+  const password =
+    input?.password !== undefined
+      ? String(input.password)
+      : String(fallback?.password ?? "");
+  const portValue = Number(input?.port ?? fallback?.port ?? 3306);
+  const ssl = input?.ssl !== undefined ? Boolean(input.ssl) : Boolean(fallback?.ssl);
+
+  return {
+    host,
+    port: Number.isInteger(portValue) ? portValue : Number.NaN,
+    user,
+    password,
+    database,
+    ssl
+  };
+}
+
+function validateMysqlConfig(config: MysqlConfig): string | null {
+  if (!config.host) return "MySQL host is required.";
+  if (!Number.isInteger(config.port) || config.port < 1 || config.port > 65535) {
+    return "MySQL port must be a valid TCP port.";
+  }
+  if (!config.user) return "MySQL user is required.";
+  if (!config.database) return "MySQL database name is required.";
+  return null;
+}
+
+app.set("trust proxy", process.env.TRUST_PROXY || "loopback, linklocal, uniquelocal");
 console.log(`Starting server. NODE_ENV: ${process.env.NODE_ENV}`);
 
 // Enterprise Security Headers & Request Logger
 app.use((req, res, next) => {
-  res.header("Access-Control-Allow-Origin", "*");
-  res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Authorization");
-  res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+  const origin = typeof req.headers.origin === "string" ? req.headers.origin : undefined;
+  if (!isOriginAllowed(origin)) {
+    return res.status(403).json({ error: "CORS origin is not allowed." });
+  }
+
+  if (origin) {
+    res.header("Access-Control-Allow-Origin", origin);
+    res.header("Vary", "Origin");
+  }
+  res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Authorization, x-workspace-id");
+  res.header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
   res.header("X-Content-Type-Options", "nosniff");
-  res.header("X-XSS-Protection", "1; mode=block");
-  res.header("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  res.header("X-Frame-Options", "SAMEORIGIN");
+  res.header("Referrer-Policy", "strict-origin-when-cross-origin");
+  res.header("Cross-Origin-Opener-Policy", "same-origin");
+  res.header("Cross-Origin-Resource-Policy", "same-origin");
+  res.header("Permissions-Policy", "camera=(self), geolocation=(self), microphone=()");
+  res.header("X-XSS-Protection", "0");
+  if (isProduction) {
+    res.header("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  }
 
   if (req.method === "OPTIONS") {
-    return res.sendStatus(200);
+    return res.sendStatus(204);
   }
   console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
   next();
 });
-
-const JWT_SECRET = process.env.JWT_SECRET || "construction-company-secret-key-2026";
-if (process.env.NODE_ENV === "production" && (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32)) {
-  console.warn("⚠️ [SECURITY NOTICE] Production deployment detected without a custom 32+ character JWT_SECRET! Please supply a secure JWT_SECRET in your environment.");
-}
 
 // In-Memory Brute Force Login Protection
 interface LoginFailureRecord {
@@ -505,6 +572,28 @@ app.post("/api/events/broadcast", authenticateToken, (req: AuthenticatedRequest,
 app.get("/api/database/status", (req: Request, res: Response) => {
   try {
     const status = databaseManager.getStatus();
+    const authHeader = req.headers["authorization"];
+    const token = authHeader && authHeader.startsWith("Bearer ") ? authHeader.split(" ")[1] : null;
+    let isAdmin = false;
+    if (token) {
+      try {
+        const decoded: any = jwt.verify(token, JWT_SECRET);
+        isAdmin = ["SuperAdmin", "AdminCreator", "AdminManager", "Admin", "Bootstrap"].includes(decoded.role);
+      } catch (_) {}
+    }
+
+    if (!isAdmin) {
+      return res.json({
+        activeEngine: status.activeEngine,
+        effectiveEngine: status.effectiveEngine,
+        isFallback: status.isFallback,
+        mysql: {
+          connected: status.mysql.connected,
+          status: status.mysql.status,
+          error: status.mysql.connected ? null : status.mysql.error || "Database unavailable"
+        }
+      });
+    }
     res.json(status);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -527,15 +616,13 @@ app.post("/api/database/test-connection", (req: Request, res: Response) => {
       } catch (_) {}
     }
 
-    const { host, port, user, password, database, ssl } = req.body;
-    const testResult = databaseManager.testMysqlConnection({
-      host: host || "127.0.0.1",
-      port: Number(port) || 3306,
-      user: user || "root",
-      password: password !== undefined ? password : "",
-      database: database || "buildtrack_ams",
-      ssl: !!ssl
-    });
+    const targetConfig = sanitizeMysqlConfig(req.body);
+    const validationError = validateMysqlConfig(targetConfig);
+    if (validationError) {
+      return res.status(400).json({ success: false, error: validationError });
+    }
+
+    const testResult = databaseManager.testMysqlConnection(targetConfig);
     res.json(testResult);
   } catch (err: any) {
     res.status(500).json({ success: false, error: err.message });
@@ -562,15 +649,11 @@ app.post("/api/database/setup", (req: Request, res: Response) => {
       } catch (_) {}
     }
 
-    const { host, port, user, password, database, ssl } = req.body;
-    const targetConfig = {
-      host: host || "127.0.0.1",
-      port: Number(port) || 3306,
-      user: user || "root",
-      password: password !== undefined ? password : "",
-      database: database || "buildtrack_ams",
-      ssl: !!ssl
-    };
+    const targetConfig = sanitizeMysqlConfig(req.body);
+    const validationError = validateMysqlConfig(targetConfig);
+    if (validationError) {
+      return res.status(400).json({ success: false, error: validationError });
+    }
 
     const testResult = databaseManager.testMysqlConnection(targetConfig);
     if (!testResult.success) {
@@ -615,14 +698,17 @@ app.post("/api/database/config", authenticateToken, (req: AuthenticatedRequest, 
     const { mysql } = req.body;
     const currentStatus = databaseManager.getStatus();
 
-    const mysqlTargetConfig = {
-      host: mysql?.host || currentStatus.mysql.details?.host || "127.0.0.1",
-      port: Number(mysql?.port || currentStatus.mysql.details?.port || 3306),
-      user: mysql?.user || currentStatus.mysql.details?.user || "root",
-      password: mysql?.password !== undefined ? mysql.password : "",
-      database: mysql?.database || currentStatus.mysql.details?.database || "buildtrack_ams",
-      ssl: mysql?.ssl !== undefined ? !!mysql.ssl : false
-    };
+    const mysqlTargetConfig = sanitizeMysqlConfig(mysql, {
+      host: currentStatus.mysql.details?.host,
+      port: currentStatus.mysql.details?.port,
+      user: currentStatus.mysql.details?.user,
+      database: currentStatus.mysql.details?.database,
+      ssl: false
+    });
+    const validationError = validateMysqlConfig(mysqlTargetConfig);
+    if (validationError) {
+      return res.status(400).json({ error: validationError });
+    }
 
     const testResult = databaseManager.testMysqlConnection(mysqlTargetConfig);
     let connectionWarning: string | null = null;

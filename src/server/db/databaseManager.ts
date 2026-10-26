@@ -42,6 +42,12 @@ function getResolvedConfigPath(): string {
   return path.join(process.cwd(), "database-config.json");
 }
 
+const allowSqliteFallback =
+  process.env.ALLOW_SQLITE_FALLBACK === "true" ||
+  process.env.NODE_ENV !== "production";
+
+const allowRuntimeConfigPersistence = process.env.ALLOW_RUNTIME_DB_CONFIG_PERSIST === "true";
+
 export class DatabaseManager implements IDatabaseDriver {
   public name: DatabaseEngine = "mysql";
   private mysqlDriver: MysqlDriver;
@@ -183,7 +189,18 @@ export class DatabaseManager implements IDatabaseDriver {
       this.notifyConnected();
       return true;
     } else {
-      console.warn(`[DatabaseManager] MySQL connection unavailable (${this.mysqlDriver.getLastError()}). Falling back to local SQLite engine.`);
+      const mysqlError = this.mysqlDriver.getLastError();
+      if (!allowSqliteFallback) {
+        console.error(`[DatabaseManager] MySQL connection unavailable (${mysqlError}). SQLite fallback is disabled in production.`);
+        this.activeDriver = this.mysqlDriver;
+        this.effectiveEngine = "mysql";
+        this.isFallback = false;
+        this.name = "mysql";
+        this.startReconnectLoop();
+        return false;
+      }
+
+      console.warn(`[DatabaseManager] MySQL connection unavailable (${mysqlError}). Falling back to local SQLite engine.`);
       const sqliteOk = this.sqliteDriver.init();
       if (sqliteOk) {
         try {
@@ -232,31 +249,33 @@ export class DatabaseManager implements IDatabaseDriver {
       }
     };
 
-    // Save configuration file
-    try {
-      fs.writeFileSync(getResolvedConfigPath(), JSON.stringify(this.config, null, 2));
-    } catch (_) {}
+    if (allowRuntimeConfigPersistence) {
+      try {
+        fs.writeFileSync(getResolvedConfigPath(), JSON.stringify(this.config, null, 2));
+      } catch (_) {}
 
-    // Persist to .env if writable
-    try {
-      const envPath = path.join(process.cwd(), ".env");
-      let envContent = fs.existsSync(envPath) ? fs.readFileSync(envPath, "utf-8") : "";
-      const setEnvVar = (key: string, val: string) => {
-        const regex = new RegExp(`^${key}=.*$`, "m");
-        if (regex.test(envContent)) {
-          envContent = envContent.replace(regex, `${key}=${val}`);
-        } else {
-          envContent += (envContent.endsWith("\n") || !envContent ? "" : "\n") + `${key}=${val}\n`;
-        }
-      };
-      setEnvVar("DB_TYPE", "mysql");
-      setEnvVar("MYSQL_HOST", this.config.mysql.host);
-      setEnvVar("MYSQL_PORT", String(this.config.mysql.port));
-      setEnvVar("MYSQL_USER", this.config.mysql.user);
-      setEnvVar("MYSQL_PASSWORD", this.config.mysql.password || "");
-      setEnvVar("MYSQL_DATABASE", this.config.mysql.database);
-      fs.writeFileSync(envPath, envContent);
-    } catch (_) {}
+      try {
+        const envPath = path.join(process.cwd(), ".env");
+        let envContent = fs.existsSync(envPath) ? fs.readFileSync(envPath, "utf-8") : "";
+        const setEnvVar = (key: string, val: string) => {
+          const regex = new RegExp(`^${key}=.*$`, "m");
+          if (regex.test(envContent)) {
+            envContent = envContent.replace(regex, `${key}=${val}`);
+          } else {
+            envContent += (envContent.endsWith("\n") || !envContent ? "" : "\n") + `${key}=${val}\n`;
+          }
+        };
+        setEnvVar("DB_TYPE", "mysql");
+        setEnvVar("MYSQL_HOST", this.config.mysql.host);
+        setEnvVar("MYSQL_PORT", String(this.config.mysql.port));
+        setEnvVar("MYSQL_USER", this.config.mysql.user);
+        setEnvVar("MYSQL_PASSWORD", this.config.mysql.password || "");
+        setEnvVar("MYSQL_DATABASE", this.config.mysql.database);
+        fs.writeFileSync(envPath, envContent);
+      } catch (_) {}
+    } else {
+      console.warn("[DatabaseManager] Runtime DB config persistence is disabled. Credentials will remain in memory only.");
+    }
 
     const ok = this.mysqlDriver.init(this.config.mysql);
     if (ok) {

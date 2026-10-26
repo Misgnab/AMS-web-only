@@ -1,5 +1,14 @@
-export const JWT_SECRET = process.env.JWT_SECRET || "construction-company-secret-key-2026";
+import crypto from "node:crypto";
 
-if (process.env.NODE_ENV === "production" && (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32)) {
-  console.warn("⚠️ [SECURITY NOTICE] Production deployment detected without a custom 32+ character JWT_SECRET! Please supply a secure JWT_SECRET in your environment.");
+const configuredJwtSecret = process.env.JWT_SECRET?.trim();
+const isProduction = process.env.NODE_ENV === "production";
+
+if (isProduction && (!configuredJwtSecret || configuredJwtSecret.length < 32)) {
+  throw new Error("JWT_SECRET must be set to a 32+ character value in production.");
 }
+
+if (!configuredJwtSecret) {
+  console.warn("[Security] JWT_SECRET is not set. Using an ephemeral development secret.");
+}
+
+export const JWT_SECRET = configuredJwtSecret || crypto.randomBytes(32).toString("hex");

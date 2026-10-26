@@ -9,6 +9,7 @@ const WORKER_CODE = `
   const int32 = new Int32Array(workerData.sab);
   let pool = null;
   let currentConfig = null;
+  const shouldRejectUnauthorized = process.env.MYSQL_SSL_REJECT_UNAUTHORIZED !== "false";
 
   async function handleMessage(msg) {
     switch (msg.type) {
@@ -21,7 +22,7 @@ const WORKER_CODE = `
             port: msg.config.port || 3306,
             user: msg.config.user || "root",
             password: msg.config.password !== undefined ? msg.config.password : "",
-            ssl: msg.config.ssl ? { rejectUnauthorized: false } : undefined,
+            ssl: msg.config.ssl ? { rejectUnauthorized: shouldRejectUnauthorized } : undefined,
             connectTimeout: ["127.0.0.1", "localhost"].includes(msg.config.host || "") ? 1000 : 7000
           };
 
@@ -151,7 +152,7 @@ const WORKER_CODE = `
             user: cfg.user || "root",
             password: cfg.password !== undefined ? cfg.password : "",
             database: cfg.database || undefined,
-            ssl: cfg.ssl ? { rejectUnauthorized: false } : undefined,
+            ssl: cfg.ssl ? { rejectUnauthorized: shouldRejectUnauthorized } : undefined,
             connectTimeout: 5000
           });
           const [res] = await conn.query("SELECT VERSION() as version");
