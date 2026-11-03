@@ -1400,6 +1400,10 @@ app.put("/api/employees/:id/hourly-rate", authenticateToken, (req: Authenticated
   const { id } = req.params;
   const { hourly_rate } = req.body;
 
+  if (parseInt(id, 10) === req.user?.id && currentRole !== "SuperAdmin") {
+    return res.status(403).json({ error: "Access denied. Administrators cannot modify their own salary or hourly rate." });
+  }
+
   if (hourly_rate === undefined || isNaN(parseFloat(hourly_rate))) {
     return res.status(400).json({ error: "Valid hourly rate is required" });
   }
@@ -1423,6 +1427,7 @@ app.put("/api/employees/:id/hourly-rate", authenticateToken, (req: Authenticated
 
 // Mount Super Administrator Central Management Router (Strictly SuperAdmin-only)
 app.use("/api/super-admin", authenticateToken, superAdminRouter);
+app.use("/api/superadmin", authenticateToken, superAdminRouter);
 
 // Fetch workspaces list (SuperAdmin sees all; Workspace Admin sees only authorized workspace)
 app.get("/api/workspaces", authenticateToken, (req: AuthenticatedRequest, res: Response) => {

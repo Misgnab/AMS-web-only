@@ -63,7 +63,7 @@ export async function runAutomatedSecurityTests(serverPort: number = 3000): Prom
     // Admin A
     const resAdminA = db.prepare(`
       INSERT INTO users (full_name, phone_number, role, password, hourly_rate, workspace_id, status)
-      VALUES ('SecAdmin Alpha', '0999000001', 'Admin', ?, 120.0, ?, 'ACTIVE')
+      VALUES ('SecAdmin Alpha', '0999000001', 'AdminCreator', ?, 120.0, ?, 'ACTIVE')
     `).run(dummyHash, testWsAId);
     adminAId = Number(resAdminA.lastInsertRowid);
 
@@ -77,7 +77,7 @@ export async function runAutomatedSecurityTests(serverPort: number = 3000): Prom
     // Admin B
     const resAdminB = db.prepare(`
       INSERT INTO users (full_name, phone_number, role, password, hourly_rate, workspace_id, status)
-      VALUES ('SecAdmin Beta', '0999000003', 'Admin', ?, 120.0, ?, 'ACTIVE')
+      VALUES ('SecAdmin Beta', '0999000003', 'AdminCreator', ?, 120.0, ?, 'ACTIVE')
     `).run(dummyHash, testWsBId);
     adminBId = Number(resAdminB.lastInsertRowid);
 
@@ -120,9 +120,9 @@ export async function runAutomatedSecurityTests(serverPort: number = 3000): Prom
       return jwt.sign({ id, phone_number: phone, role, workspace_id: wsId }, JWT_SECRET, { expiresIn: "1h" });
     };
 
-    adminAToken = signToken(adminAId, "0999000001", "Admin", testWsAId);
+    adminAToken = signToken(adminAId, "0999000001", "AdminCreator", testWsAId);
     empAToken = signToken(empAId, "0999000002", "Employee", testWsAId);
-    adminBToken = signToken(adminBId, "0999000003", "Admin", testWsBId);
+    adminBToken = signToken(adminBId, "0999000003", "AdminCreator", testWsBId);
     empBToken = signToken(empBId, "0999000004", "Employee", testWsBId);
     superAdminToken = signToken(superAdminId, "0911223344", "SuperAdmin", 1);
 
@@ -360,12 +360,34 @@ export async function runAutomatedSecurityTests(serverPort: number = 3000): Prom
     });
 
     // -------------------------------------------------------------------------------------------------
+    // TEST 13: Super Admin Site Selection Directory (/api/super-admin/sites) & RBAC Access Control
+    // -------------------------------------------------------------------------------------------------
+    const t13Start = Date.now();
+    const r13Super = await makeReq(`/api/super-admin/sites`, superAdminToken);
+    const r13Admin = await makeReq(`/api/super-admin/sites`, adminAToken);
+    const sitesList = Array.isArray(r13Super.data) ? r13Super.data : (r13Super.data?.sites || []);
+    const hasWsA = sitesList.some((s: any) => s.id === testWsAId);
+    const hasWsB = sitesList.some((s: any) => s.id === testWsBId);
+    const t13Passed = r13Super.status === 200 && hasWsA && hasWsB && r13Admin.status === 403;
+    results.push({
+      id: "SEC-13",
+      name: "Super Admin Site Selection Directory API & Access Control",
+      category: "Site Visit & Context Switching",
+      description: "Super Admin can retrieve enriched metrics for all construction sites, while ordinary workspace admins are forbidden (403).",
+      passed: t13Passed,
+      details: t13Passed
+        ? `PASSED: Super Admin retrieved ${sitesList.length} sites with enriched metrics; Workspace Admin request rejected with 403 Forbidden.`
+        : `FAILED: Super status: ${r13Super.status}, Admin status: ${r13Admin.status}, hasAlpha: ${hasWsA}, hasBeta: ${hasWsB}`,
+      durationMs: Date.now() - t13Start
+    });
+
+    // -------------------------------------------------------------------------------------------------
     // TEST 12: Audit logs record security events and denied access attempts
     // -------------------------------------------------------------------------------------------------
     const t12Start = Date.now();
     const auditRows: any[] = db.prepare(`
       SELECT * FROM audit_logs 
-      WHERE (action LIKE '%IDOR%' OR action LIKE '%DENIED%' OR action LIKE '%UNAUTHORIZED%') 
+      WHERE (action LIKE '%IDOR%' OR action LIKE '%DENIED%' OR action LIKE '%UNAUTHORIZED%' OR action LIKE '%SUPERADMIN%') 
          OR (outcome = 'DENIED')
       ORDER BY id DESC LIMIT 10
     `).all();
@@ -380,28 +402,6 @@ export async function runAutomatedSecurityTests(serverPort: number = 3000): Prom
         ? `PASSED: Confirmed security audit logs recorded (found ${auditRows.length} recent security events in audit_logs).`
         : `FAILED: No security logs found in audit_logs table.`,
       durationMs: Date.now() - t12Start
-    });
-
-    // -------------------------------------------------------------------------------------------------
-    // TEST 13: Super Admin Site Selection Directory (/api/super-admin/sites) & RBAC Access Control
-    // -------------------------------------------------------------------------------------------------
-    const t13Start = Date.now();
-    const r13Super = await makeReq(`/api/super-admin/sites`, superAdminToken);
-    const r13Admin = await makeReq(`/api/super-admin/sites`, adminAToken);
-    const sitesList = Array.isArray(r13Super.data?.sites) ? r13Super.data.sites : [];
-    const hasWsA = sitesList.some((s: any) => s.id === testWsAId);
-    const hasWsB = sitesList.some((s: any) => s.id === testWsBId);
-    const t13Passed = r13Super.status === 200 && hasWsA && hasWsB && r13Admin.status === 403;
-    results.push({
-      id: "SEC-13",
-      name: "Super Admin Site Selection Directory API & Access Control",
-      category: "Site Visit & Context Switching",
-      description: "Super Admin can retrieve enriched metrics for all construction sites, while ordinary workspace admins are forbidden (403).",
-      passed: t13Passed,
-      details: t13Passed
-        ? `PASSED: Super Admin retrieved ${sitesList.length} sites with enriched metrics; Workspace Admin request rejected with 403 Forbidden.`
-        : `FAILED: Super status: ${r13Super.status}, Admin status: ${r13Admin.status}, hasAlpha: ${hasWsA}, hasBeta: ${hasWsB}`,
-      durationMs: Date.now() - t13Start
     });
 
     // -------------------------------------------------------------------------------------------------

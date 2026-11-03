@@ -27,7 +27,8 @@ import {
   ChevronRight,
   Database,
   Layers,
-  ArrowRight
+  ArrowRight,
+  Play
 } from "lucide-react";
 
 export const SuperAdminManagementTab: React.FC = () => {
@@ -50,7 +51,8 @@ export const SuperAdminManagementTab: React.FC = () => {
     toggleAdminStatus,
     fetchSuperAdminAuditLogs,
     fetchSuperAdminSecurityEvents,
-    visitSite
+    visitSite,
+    runSecurityTests
   } = useAppStore();
 
   const [activeSubTab, setActiveSubTab] = useState<"workspaces" | "admins" | "audit" | "security">("workspaces");
@@ -59,6 +61,10 @@ export const SuperAdminManagementTab: React.FC = () => {
   const [actionSuccess, setActionSuccess] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
+
+  // Security test suite state
+  const [securityTestSuite, setSecurityTestSuite] = useState<SecurityTestSuiteSummary | null>(null);
+  const [isRunningSecurityTests, setIsRunningSecurityTests] = useState(false);
 
   // Modals state
   const [isWorkspaceModalOpen, setIsWorkspaceModalOpen] = useState(false);
@@ -302,6 +308,27 @@ export const SuperAdminManagementTab: React.FC = () => {
       return true;
     });
   }, [superAdminAdmins, adminFilterWs, adminFilterRole, adminSearch]);
+
+  const handleRunSecurityTests = async () => {
+    setIsRunningSecurityTests(true);
+    try {
+      const summary = await runSecurityTests();
+      if (summary) {
+        setSecurityTestSuite(summary);
+        if (summary.allPassed) {
+          triggerSuccess(`All ${summary.total} Automated Security & Isolation tests passed!`);
+        } else {
+          triggerError(`${summary.failed} of ${summary.total} tests failed. Inspect the test output below.`);
+        }
+      } else {
+        triggerError("Failed to execute security tests.");
+      }
+    } catch (err: any) {
+      triggerError(err.message || "Failed to run automated security tests.");
+    } finally {
+      setIsRunningSecurityTests(false);
+    }
+  };
 
   return (
     <div className="space-y-6">
@@ -988,7 +1015,132 @@ export const SuperAdminManagementTab: React.FC = () => {
       {/* SUB-TAB 4: SECURITY EVENTS & FAILED LOGINS */}
       {/* ==================================================================== */}
       {activeSubTab === "security" && (
-        <div className="space-y-4">
+        <div className="space-y-5">
+          {/* Automated Security & Isolation Test Runner */}
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 text-white shadow-md">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+              <div className="flex items-start gap-3.5">
+                <div className="w-10 h-10 rounded-xl bg-indigo-500/20 text-indigo-400 border border-indigo-400/30 flex items-center justify-center shrink-0">
+                  <ShieldCheck size={20} />
+                </div>
+                <div>
+                  <div className="flex items-center gap-2">
+                    <h3 className="text-base font-black text-white">Automated Security & Multi-Workspace Isolation Test Suite</h3>
+                    <span className="px-2 py-0.5 bg-indigo-500/30 text-indigo-300 text-[10px] font-bold rounded-full border border-indigo-400/30">
+                      16 Comprehensive Tests
+                    </span>
+                  </div>
+                  <p className="text-xs text-slate-300 mt-1 max-w-2xl leading-relaxed">
+                    Verify RBAC permissions, cross-workspace isolation barriers, site visit context scoping, header forgery prevention, financial tampering prevention, and audit trails.
+                  </p>
+                </div>
+              </div>
+
+              <button
+                type="button"
+                onClick={handleRunSecurityTests}
+                disabled={isRunningSecurityTests}
+                className="px-4 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-bold transition flex items-center gap-2 shadow-md shadow-indigo-950/40 cursor-pointer disabled:opacity-50 shrink-0 self-start sm:self-auto"
+              >
+                {isRunningSecurityTests ? (
+                  <>
+                    <RefreshCw size={14} className="animate-spin" />
+                    <span>Executing 16 Tests...</span>
+                  </>
+                ) : (
+                  <>
+                    <Play size={14} />
+                    <span>Run Security Tests</span>
+                  </>
+                )}
+              </button>
+            </div>
+
+            {/* Test Results Display */}
+            {securityTestSuite && (
+              <div className="mt-5 pt-5 border-t border-slate-800 space-y-4">
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                  <div className="bg-slate-800/60 border border-slate-700/60 rounded-xl p-3">
+                    <span className="text-[10px] font-bold uppercase text-slate-400 block">Total Tests</span>
+                    <span className="text-xl font-black text-white mt-0.5 block">{securityTestSuite.total}</span>
+                  </div>
+                  <div className="bg-emerald-950/40 border border-emerald-800/40 rounded-xl p-3">
+                    <span className="text-[10px] font-bold uppercase text-emerald-400 block">Passed</span>
+                    <span className="text-xl font-black text-emerald-400 mt-0.5 block">{securityTestSuite.passed}</span>
+                  </div>
+                  <div className={`rounded-xl p-3 border ${
+                    securityTestSuite.failed > 0 
+                      ? "bg-rose-950/40 border-rose-800/40 text-rose-400" 
+                      : "bg-slate-800/60 border-slate-700/60 text-slate-400"
+                  }`}>
+                    <span className="text-[10px] font-bold uppercase block">Failed</span>
+                    <span className={`text-xl font-black mt-0.5 block ${securityTestSuite.failed > 0 ? "text-rose-400" : "text-slate-400"}`}>
+                      {securityTestSuite.failed}
+                    </span>
+                  </div>
+                  <div className="bg-slate-800/60 border border-slate-700/60 rounded-xl p-3">
+                    <span className="text-[10px] font-bold uppercase text-slate-400 block">Status</span>
+                    <span className={`text-xs font-black mt-1 inline-flex items-center gap-1.5 px-2 py-0.5 rounded ${
+                      securityTestSuite.allPassed 
+                        ? "bg-emerald-500/20 text-emerald-300 border border-emerald-500/40" 
+                        : "bg-rose-500/20 text-rose-300 border border-rose-500/40"
+                    }`}>
+                      {securityTestSuite.allPassed ? (
+                        <>
+                          <CheckCircle size={12} />
+                          ALL PASSED
+                        </>
+                      ) : (
+                        <>
+                          <AlertTriangle size={12} />
+                          FAILURES DETECTED
+                        </>
+                      )}
+                    </span>
+                  </div>
+                </div>
+
+                <div className="bg-slate-950/70 rounded-xl border border-slate-800 overflow-hidden">
+                  <div className="overflow-x-auto max-h-80 overflow-y-auto">
+                    <table className="w-full text-left text-xs text-slate-300">
+                      <thead className="bg-slate-900 border-b border-slate-800 text-[10px] uppercase font-bold text-slate-400 sticky top-0">
+                        <tr>
+                          <th className="px-3 py-2.5">ID</th>
+                          <th className="px-3 py-2.5">Category</th>
+                          <th className="px-3 py-2.5">Test Case Name</th>
+                          <th className="px-3 py-2.5">Status</th>
+                          <th className="px-3 py-2.5">Time</th>
+                          <th className="px-3 py-2.5">Result Details</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-800/70 font-mono text-[11px]">
+                        {securityTestSuite.results.map((test) => (
+                          <tr key={test.id} className="hover:bg-slate-800/40 transition">
+                            <td className="px-3 py-2 font-bold text-indigo-400 whitespace-nowrap">{test.id}</td>
+                            <td className="px-3 py-2 text-slate-400 font-sans whitespace-nowrap">{test.category}</td>
+                            <td className="px-3 py-2 font-sans font-bold text-white whitespace-nowrap">{test.name}</td>
+                            <td className="px-3 py-2 whitespace-nowrap">
+                              <span className={`px-2 py-0.5 rounded text-[10px] font-black ${
+                                test.passed 
+                                  ? "bg-emerald-900/40 text-emerald-300 border border-emerald-700/50" 
+                                  : "bg-rose-900/40 text-rose-300 border border-rose-700/50"
+                              }`}>
+                                {test.passed ? "PASSED" : "FAILED"}
+                              </span>
+                            </td>
+                            <td className="px-3 py-2 text-slate-400 whitespace-nowrap">{test.durationMs}ms</td>
+                            <td className="px-3 py-2 font-sans text-slate-300 text-xs">{test.details}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Security Telemetry & Access Anomalies */}
           <div className="bg-gradient-to-r from-rose-900/10 via-amber-900/10 to-transparent p-5 rounded-2xl border border-rose-200 shadow-xs flex items-start gap-4">
             <div className="w-10 h-10 rounded-xl bg-rose-100 text-rose-700 flex items-center justify-center shrink-0 mt-0.5 shadow-xs">
               <ShieldAlert size={20} />

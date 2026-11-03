@@ -146,11 +146,15 @@ export class DatabaseManager implements IDatabaseDriver {
       } catch (_) {}
     }
 
-    const host = process.env.MYSQL_HOST || savedConfig?.mysql?.host || "127.0.0.1";
+    const rawHost = process.env.MYSQL_HOST || savedConfig?.mysql?.host || "127.0.0.1";
+    const host = typeof rawHost === "string" ? rawHost.trim() : "127.0.0.1";
     const port = Number(process.env.MYSQL_PORT || savedConfig?.mysql?.port || 3306);
-    const user = process.env.MYSQL_USER || savedConfig?.mysql?.user || "root";
-    const password = process.env.MYSQL_PASSWORD !== undefined ? process.env.MYSQL_PASSWORD : (savedConfig?.mysql?.password ?? "");
-    const database = process.env.MYSQL_DATABASE || savedConfig?.mysql?.database || "buildtrack_ams";
+    const rawUser = process.env.MYSQL_USER || savedConfig?.mysql?.user || "root";
+    const user = typeof rawUser === "string" ? rawUser.trim() : "root";
+    const rawPassword = process.env.MYSQL_PASSWORD !== undefined ? process.env.MYSQL_PASSWORD : (savedConfig?.mysql?.password ?? "");
+    const password = typeof rawPassword === "string" ? rawPassword.trim() : String(rawPassword || "");
+    const rawDatabase = process.env.MYSQL_DATABASE || savedConfig?.mysql?.database || "buildtrack_ams";
+    const database = typeof rawDatabase === "string" ? rawDatabase.trim() : "buildtrack_ams";
     const ssl = process.env.MYSQL_SSL === "true" || !!savedConfig?.mysql?.ssl;
 
     return {
@@ -181,8 +185,18 @@ export class DatabaseManager implements IDatabaseDriver {
       this.name = "mysql";
       console.log(`[DatabaseManager] Connected to MySQL database (${this.config.mysql.host}:${this.config.mysql.port}/${this.config.mysql.database}).`);
       this.notifyConnected();
-      return true;
     } else {
+      const requireMysql = process.env.REQUIRE_MYSQL === "true" || process.env.DB_TYPE === "mysql";
+      if (requireMysql) {
+        console.error(`[DatabaseManager] Strict MySQL mode enabled (REQUIRE_MYSQL=true or DB_TYPE=mysql). MySQL connection failed: ${this.mysqlDriver.getLastError()}`);
+        this.activeDriver = this.mysqlDriver;
+        this.effectiveEngine = "mysql";
+        this.isFallback = false;
+        this.name = "mysql";
+        this.startReconnectLoop();
+        return false;
+      }
+
       console.warn(`[DatabaseManager] MySQL connection unavailable (${this.mysqlDriver.getLastError()}). Falling back to local SQLite engine.`);
       const sqliteOk = this.sqliteDriver.init();
       if (sqliteOk) {
@@ -222,11 +236,11 @@ export class DatabaseManager implements IDatabaseDriver {
     this.config = {
       activeEngine: "mysql",
       mysql: {
-        host: newConfig.mysql.host || "127.0.0.1",
+        host: (newConfig.mysql.host || "127.0.0.1").trim(),
         port: Number(newConfig.mysql.port) || 3306,
-        user: newConfig.mysql.user || "root",
-        password: newConfig.mysql.password !== undefined ? newConfig.mysql.password : "",
-        database: newConfig.mysql.database || "buildtrack_ams",
+        user: (newConfig.mysql.user || "root").trim(),
+        password: typeof newConfig.mysql.password === "string" ? newConfig.mysql.password.trim() : "",
+        database: (newConfig.mysql.database || "buildtrack_ams").trim(),
         ssl: !!newConfig.mysql.ssl,
         connectionLimit: 15
       }

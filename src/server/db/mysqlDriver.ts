@@ -15,14 +15,19 @@ const WORKER_CODE = `
       case "init": {
         try {
           currentConfig = msg.config;
-          const targetDb = msg.config.database || "buildtrack_ams";
+          const rawHost = String(msg.config.host || "127.0.0.1").trim();
+          const targetDb = String(msg.config.database || "buildtrack_ams").trim();
+          const targetUser = String(msg.config.user || "root").trim();
+          const targetPass = msg.config.password !== undefined ? String(msg.config.password).trim() : "";
+          const targetPort = Number(msg.config.port) || 3306;
+
           const connConfig = {
-            host: msg.config.host || "127.0.0.1",
-            port: msg.config.port || 3306,
-            user: msg.config.user || "root",
-            password: msg.config.password !== undefined ? msg.config.password : "",
+            host: rawHost,
+            port: targetPort,
+            user: targetUser,
+            password: targetPass,
             ssl: msg.config.ssl ? { rejectUnauthorized: false } : undefined,
-            connectTimeout: ["127.0.0.1", "localhost"].includes(msg.config.host || "") ? 1000 : 7000
+            connectTimeout: ["127.0.0.1", "localhost"].includes(rawHost) ? 3000 : 8000
           };
 
           if (pool) {
@@ -57,6 +62,34 @@ const WORKER_CODE = `
             if (pool) {
               try { await pool.end(); } catch (_) {}
               pool = null;
+            }
+
+            // If localhost failed due to socket/network resolution on Linux, retry with 127.0.0.1
+            if (connConfig.host === "localhost" && (err.code === "ECONNREFUSED" || err.code === "ENOENT")) {
+              try {
+                connConfig.host = "127.0.0.1";
+                pool = mysql.createPool({
+                  ...connConfig,
+                  database: targetDb,
+                  waitForConnections: true,
+                  connectionLimit: msg.config.connectionLimit || 10,
+                  queueLimit: 0,
+                  multipleStatements: true,
+                  dateStrings: true,
+                  enableKeepAlive: true,
+                  keepAliveInitialDelay: 10000
+                });
+                const start = Date.now();
+                const [res] = await pool.query("SELECT 1 as alive, VERSION() as version");
+                const latency = Date.now() - start;
+                return { ok: true, version: res[0]?.version || "MySQL", latency };
+              } catch (retryErr) {
+                directError = retryErr;
+                if (pool) {
+                  try { await pool.end(); } catch (_) {}
+                  pool = null;
+                }
+              }
             }
           }
 
